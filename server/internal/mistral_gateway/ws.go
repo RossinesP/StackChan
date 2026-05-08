@@ -8,6 +8,7 @@ package mistral_gateway
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -204,7 +205,7 @@ func handleJSON(ctx context.Context, conn *websocket.Conn, sess *Session, payloa
 			sess.StartListening()
 		case "stop":
 			sess.StopListening()
-			if err := playbackEcho(ctx, conn, sess); err != nil {
+			if err := playbackReply(ctx, conn, sess); err != nil {
 				g.Log().Errorf(ctx, "playback failed: %v", err)
 			}
 		}
@@ -258,7 +259,7 @@ func handleAudio(ctx context.Context, conn *websocket.Conn, sess *Session, paylo
 	// playback are ignored because IsListening() is now false.
 	if n >= echoFlushFrames {
 		sess.StopListening()
-		if err := playbackEcho(ctx, conn, sess); err != nil {
+		if err := playbackReply(ctx, conn, sess); err != nil {
 			g.Log().Errorf(ctx, "auto-flush playback: %v", err)
 		}
 	}
@@ -268,43 +269,131 @@ func handleAudio(ctx context.Context, conn *websocket.Conn, sess *Session, paylo
 // opus frames. At 60 ms/frame this is ~3 s of audio.
 const echoFlushFrames = 50
 
+// playbackReply dispatches between TTS (M4) and echo (M3) based on
+// whether MISTRAL_API_KEY is set. Echo remains as a no-network fallback
+// for offline development.
+func playbackReply(ctx context.Context, conn *websocket.Conn, sess *Session) error {
+	if Get().MistralAPIKey != "" {
+		return playbackTTS(ctx, conn, sess, Get().TTSReplyText)
+	}
+	return playbackEcho(ctx, conn, sess)
+}
+
 // playbackEcho sends the buffered re-encoded opus back to the device,
-// bracketed with `tts state:start` / `tts state:stop` so the device
-// transitions to speaking mode and plays the audio.
-//
-// xiaozhi-esp32's application.cc puts the device in kDeviceStateSpeaking
-// on tts:start and queues incoming opus to the audio service for
-// playback.
+// bracketed with `tts state:start` / `tts state:stop`. M3 fallback —
+// proves the audio pipeline works without an API key.
 func playbackEcho(ctx context.Context, conn *websocket.Conn, sess *Session) error {
 	frames := sess.DrainEcho()
 	if len(frames) == 0 {
 		g.Log().Debugf(ctx, "playback skipped: no audio buffered")
 		return nil
 	}
-	g.Log().Infof(ctx, "playback start  device_id=%s  frames=%d", sess.DeviceID, len(frames))
+	g.Log().Infof(ctx, "playback echo  device_id=%s  frames=%d", sess.DeviceID, len(frames))
+	return streamFramesAsTTS(conn, sess, "(echo)", frames)
+}
 
+// playbackTTS synthesizes `text` via Voxtral, resamples to the device's
+// negotiated rate, opus-encodes 60 ms frames, and streams them to the
+// device wrapped in tts:start/stop. M4 milestone.
+func playbackTTS(ctx context.Context, conn *websocket.Conn, sess *Session, text string) error {
+	t0 := time.Now()
+	c := Get()
+	voiceHint := c.TTSVoice
+	if voiceHint == "" {
+		voiceHint = "(auto-discovered)"
+	}
+	g.Log().Infof(ctx, "tts request  device_id=%s  voice=%s  text=%q",
+		sess.DeviceID, voiceHint, text)
+
+	audio, err := SynthesizeSpeech(ctx, text)
+	if err != nil {
+		// Fall back to echo so the user still gets feedback that the
+		// pipeline works (and so a transient API outage doesn't make
+		// the device feel broken).
+		g.Log().Errorf(ctx, "tts failed, falling back to echo: %v", err)
+		return playbackEcho(ctx, conn, sess)
+	}
+	g.Log().Infof(ctx,
+		"tts response  device_id=%s  src_rate=%d Hz  src_samples=%d  api_ms=%d",
+		sess.DeviceID, audio.SampleRate, len(audio.PCM), time.Since(t0).Milliseconds(),
+	)
+
+	// Resample to whatever the device negotiated (typically 16 kHz).
+	resampled := Resample16(audio.PCM, audio.SampleRate, sess.Codec.sampleRate)
+
+	// Voxtral output is mastered conservatively — boost to a sensible
+	// peak so the StackChan speaker is audible at normal listening
+	// distance without the user reaching for the volume knob.
+	boosted := PeakNormalize(resampled, c.TTSPeakTarget)
+
+	chunks := SplitFrames(boosted, sess.Codec.frameSamples)
+
+	frames := make([][]byte, 0, len(chunks))
+	for _, pcm := range chunks {
+		opusFrame, err := sess.Codec.Encode(pcm)
+		if err != nil {
+			return fmt.Errorf("opus encode TTS chunk: %w", err)
+		}
+		// Encode aliases an internal buffer; copy.
+		cp := make([]byte, len(opusFrame))
+		copy(cp, opusFrame)
+		frames = append(frames, cp)
+	}
+	g.Log().Infof(ctx, "tts encoded  device_id=%s  opus_frames=%d", sess.DeviceID, len(frames))
+
+	// Drop any buffered echo from the listening window — TTS replaces it.
+	sess.DrainEcho()
+	return streamFramesAsTTS(conn, sess, text, frames)
+}
+
+// streamFramesAsTTS writes the standard tts:start / sentence_start /
+// binary opus frames / tts:stop sequence.
+//
+// Critical: frames are PACED at real-time (~60 ms each). The device's
+// audio service has a finite ring buffer (a few hundred ms); if we
+// burst all frames as fast as the WS can send, the buffer overflows
+// and you hear the start of the reply, silence, then the tail-end
+// re-trigger as the queue drains. Pacing slightly faster than playback
+// keeps the buffer near-full without overrunning it.
+func streamFramesAsTTS(conn *websocket.Conn, sess *Session, label string, frames [][]byte) error {
+	if len(frames) == 0 {
+		return nil
+	}
 	if err := conn.WriteJSON(map[string]string{"type": "tts", "state": "start"}); err != nil {
 		return err
 	}
 	if err := conn.WriteJSON(map[string]string{
-		"type": "tts", "state": "sentence_start", "text": "(echo)",
+		"type": "tts", "state": "sentence_start", "text": label,
 	}); err != nil {
 		return err
 	}
 
-	frameMS := uint32(60) // matches our codec's framing
+	const (
+		frameMS  uint32        = 60
+		paceTick               = 50 * time.Millisecond // ~10 ms ahead of playback
+	)
+	ticker := time.NewTicker(paceTick)
+	defer ticker.Stop()
+
 	var ts uint32
-	for _, f := range frames {
+	for i, f := range frames {
 		bp2 := EncodeBP2(sess.BP2Version, BP2TypeOpus, ts, f)
 		if err := conn.WriteMessage(websocket.BinaryMessage, bp2); err != nil {
 			return err
 		}
 		ts += frameMS
+		// Don't sleep before the first frame; we want sub-100 ms time
+		// to first audio.
+		if i < len(frames)-1 {
+			<-ticker.C
+		}
 	}
 
 	if err := conn.WriteJSON(map[string]string{"type": "tts", "state": "stop"}); err != nil {
 		return err
 	}
-	g.Log().Infof(ctx, "playback done   device_id=%s  duration=%dms", sess.DeviceID, ts)
+	g.Log().Infof(context.Background(),
+		"playback done  device_id=%s  duration=%dms  frames=%d",
+		sess.DeviceID, ts, len(frames))
 	return nil
 }

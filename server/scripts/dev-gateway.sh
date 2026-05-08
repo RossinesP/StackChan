@@ -207,6 +207,16 @@ EOF
 export GATEWAY_WS_URL="$WS_URL"
 export GATEWAY_OPUS_VERSION="${GATEWAY_OPUS_VERSION:-2}"
 
+# M4+: Mistral API key for TTS / STT / chat. Without it, gateway falls
+# back to M3 echo loopback (you hear yourself instead of a synthesized
+# reply). Set via:  export MISTRAL_API_KEY=...
+# Optional:
+#   MISTRAL_TTS_MODEL    (default: voxtral-mini-tts-2603)
+#   MISTRAL_TTS_VOICE    (default: auto-discover first voice from API;
+#                          list with: curl -H "Authorization: Bearer \$MISTRAL_API_KEY" \
+#                                      https://api.mistral.ai/v1/audio/voices | jq)
+#   GATEWAY_TTS_REPLY    (default: hello string baked into config.go)
+
 # Point GoFrame at the dev config so utility/rsa.go finds RSA keys.
 export GF_GCFG_FILE="$DEV_CONFIG"
 export GF_GCFG_PATH="$DEV_DIR"
@@ -215,6 +225,11 @@ echo "Env:"
 echo "  GATEWAY_WS_URL       = $GATEWAY_WS_URL"
 echo "  GATEWAY_OPUS_VERSION = $GATEWAY_OPUS_VERSION"
 echo "  GF_GCFG_FILE         = $GF_GCFG_FILE"
+if [[ -n "${MISTRAL_API_KEY:-}" ]]; then
+  echo "  MISTRAL_API_KEY      = sk-***${MISTRAL_API_KEY: -4} (M4 TTS enabled)"
+else
+  echo "  MISTRAL_API_KEY      = (unset → M3 echo loopback)"
+fi
 echo "Press Ctrl-C to stop."
 echo "──────────────────────────────────────────────────────────────────────────────"
 echo
