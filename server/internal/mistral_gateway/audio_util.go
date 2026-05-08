@@ -8,6 +8,7 @@ package mistral_gateway
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 )
 
 // EncodeWAVMono16 builds a minimal RIFF/WAVE container around mono
@@ -46,6 +47,29 @@ func EncodeWAVMono16(samples []int16, sampleRate int) []byte {
 	binary.Write(&buf, binary.LittleEndian, samples)
 
 	return buf.Bytes()
+}
+
+// Float32LEToInt16 converts a raw float32 little-endian PCM byte
+// stream to mono int16 samples. Voxtral streams PCM as float32 LE in
+// the [-1.0, +1.0] range; we clamp + scale to int16.
+//
+// Returns the converted samples and the number of bytes consumed (a
+// multiple of 4); any trailing bytes (incomplete float) are reported
+// so the caller can carry them across chunks.
+func Float32LEToInt16(buf []byte) (samples []int16, consumed int) {
+	consumed = (len(buf) / 4) * 4
+	samples = make([]int16, consumed/4)
+	for i := 0; i < consumed; i += 4 {
+		bits := binary.LittleEndian.Uint32(buf[i : i+4])
+		f := math.Float32frombits(bits)
+		if f > 1 {
+			f = 1
+		} else if f < -1 {
+			f = -1
+		}
+		samples[i/4] = int16(f * 32767)
+	}
+	return samples, consumed
 }
 
 // Resample16 converts mono int16 PCM from srcRate to dstRate using

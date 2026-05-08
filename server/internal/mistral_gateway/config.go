@@ -69,6 +69,18 @@ type Config struct {
 	// %s replaced by the transcript. M5 demo path. Set to empty to
 	// just speak the transcript verbatim.
 	STTReplyTemplate string
+
+	// TTSStream toggles SSE streaming for Voxtral TTS. When true (the
+	// default), audio frames stream to the device as they arrive from
+	// the API, cutting time-to-first-audio from ~3 s to ~0.8 s. When
+	// false, the gateway falls back to the M4 buffered WAV path.
+	TTSStream bool
+
+	// MistralPCMSampleRate is the sample rate Voxtral emits when we
+	// request response_format="pcm" in streaming mode. Empirically
+	// observed at 24 kHz; expose as an env var in case Mistral changes
+	// the default. Only used when TTSStream is true.
+	MistralPCMSampleRate int
 }
 
 var (
@@ -89,9 +101,11 @@ func Get() Config {
 			TTSReplyText: envOr("GATEWAY_TTS_REPLY",
 				"Hello! This is your StackChan, replying through Mistral's Voxtral text to speech."),
 			TTSPeakTarget:    envInt("GATEWAY_TTS_PEAK", 28000),
-			STTModel:         os.Getenv("MISTRAL_STT_MODEL"),
-			STTLanguage:      os.Getenv("MISTRAL_STT_LANGUAGE"),
-			STTReplyTemplate: envOr("GATEWAY_STT_REPLY", "You said: %s"),
+			STTModel:             os.Getenv("MISTRAL_STT_MODEL"),
+			STTLanguage:          os.Getenv("MISTRAL_STT_LANGUAGE"),
+			STTReplyTemplate:     envOr("GATEWAY_STT_REPLY", "You said: %s"),
+			TTSStream:            envBool("GATEWAY_TTS_STREAM", true),
+			MistralPCMSampleRate: envInt("MISTRAL_TTS_PCM_RATE", 24000),
 		}
 	})
 	return cfg
@@ -114,4 +128,18 @@ func envInt(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+func envBool(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	switch v {
+	case "1", "true", "TRUE", "yes", "on":
+		return true
+	case "0", "false", "FALSE", "no", "off":
+		return false
+	}
+	return def
 }

@@ -344,10 +344,26 @@ func playbackEcho(ctx context.Context, conn *websocket.Conn, sess *Session) erro
 	return streamFramesAsTTS(conn, sess, "(echo)", frames)
 }
 
-// playbackTTS synthesizes `text` via Voxtral, resamples to the device's
-// negotiated rate, opus-encodes 60 ms frames, and streams them to the
-// device wrapped in tts:start/stop. M4 milestone.
+// playbackTTS synthesizes `text` via Voxtral and streams it back. When
+// streaming is enabled (the default; see Config.TTSStream) it uses the
+// SSE path for sub-second time-to-first-audio. Falls back to the M4
+// buffered WAV path on stream failure or when explicitly disabled.
 func playbackTTS(ctx context.Context, conn *websocket.Conn, sess *Session, text string) error {
+	if Get().TTSStream {
+		err := playbackTTSStream(ctx, conn, sess, text)
+		if err == nil {
+			return nil
+		}
+		g.Log().Warningf(ctx, "tts stream failed, falling back to buffered: %v", err)
+	}
+	return playbackTTSBuffered(ctx, conn, sess, text)
+}
+
+// playbackTTSBuffered is the original M4 path: request the full WAV,
+// peak-normalize, encode all frames, then stream. Higher latency but
+// fewer moving parts — kept as a fallback when streaming is disabled
+// or the SSE call fails before any audio plays.
+func playbackTTSBuffered(ctx context.Context, conn *websocket.Conn, sess *Session, text string) error {
 	t0 := time.Now()
 	c := Get()
 	voiceHint := c.TTSVoice
@@ -447,5 +463,143 @@ func streamFramesAsTTS(conn *websocket.Conn, sess *Session, label string, frames
 	g.Log().Infof(context.Background(),
 		"playback done  device_id=%s  duration=%dms  frames=%d",
 		sess.DeviceID, ts, len(frames))
+	return nil
+}
+
+// playbackTTSStream is the M6 streaming path. Time-to-first-audio is
+// the round-trip to Voxtral plus one resampled+encoded frame (~60 ms),
+// vs the buffered path which waits for the full WAV (~3 s for a short
+// reply).
+//
+// Flow:
+//
+//	tts:start + sentence_start  ──>  device shows "Speaking" state
+//	  ↓
+//	for each SSE chunk from Voxtral:
+//	    PCM (24 kHz f32 LE) ──> int16 ──> resample to device rate
+//	      ↓ append to accumulator
+//	    while acc has ≥ 60 ms:
+//	      slice 60 ms frame ──> opus encode ──> BP2 ──> WS write
+//	      pace 50 ms (≈10 ms ahead of device playback)
+//	  ↓
+//	stream done ──> zero-pad remainder, send final frame
+//	  ↓
+//	tts:stop
+//
+// Pacing is INSIDE the SSE callback. If the API stalls between chunks,
+// the ticker just doesn't fire — we naturally synchronize to whichever
+// is slower (network or playback). If the API streams faster than
+// real-time (it does), TCP backpressure gates the upstream read at
+// ~50 ms intervals, which is exactly what we want.
+//
+// Skipped vs the buffered path:
+//   - PeakNormalize: needs the full waveform to find the peak.
+//     Voxtral output is mastered conservatively (~-10 dBFS); volume
+//     loss is the cost of streaming. Operator can boost speaker
+//     volume or revisit with a streaming compressor later.
+func playbackTTSStream(ctx context.Context, conn *websocket.Conn, sess *Session, text string) error {
+	t0 := time.Now()
+	c := Get()
+	voiceHint := c.TTSVoice
+	if voiceHint == "" {
+		voiceHint = "(auto-discovered)"
+	}
+	g.Log().Infof(ctx, "tts stream req  device_id=%s  voice=%s  text=%q",
+		sess.DeviceID, voiceHint, text)
+
+	if err := conn.WriteJSON(map[string]string{
+		"type": "tts", "state": "start",
+	}); err != nil {
+		return fmt.Errorf("write tts:start: %w", err)
+	}
+	if err := conn.WriteJSON(map[string]string{
+		"type": "tts", "state": "sentence_start", "text": text,
+	}); err != nil {
+		return fmt.Errorf("write sentence_start: %w", err)
+	}
+	// Drop any buffered echo — TTS replaces it.
+	sess.DrainEcho()
+
+	const (
+		frameMS  uint32        = 60
+		paceTick               = 50 * time.Millisecond
+	)
+	ticker := time.NewTicker(paceTick)
+	defer ticker.Stop()
+
+	var (
+		pcmAcc       []int16 // resampled, awaiting full-frame slicing
+		ts           uint32
+		framesSent   int
+		firstChunkAt time.Time
+	)
+	frameSamples := sess.Codec.frameSamples
+	dstRate := sess.Codec.sampleRate
+
+	emit := func(frame []int16) error {
+		opusFrame, err := sess.Codec.Encode(frame)
+		if err != nil {
+			return fmt.Errorf("opus encode: %w", err)
+		}
+		// Encode aliases an internal buffer; copy before WS send.
+		cp := make([]byte, len(opusFrame))
+		copy(cp, opusFrame)
+		bp2 := EncodeBP2(sess.BP2Version, BP2TypeOpus, ts, cp)
+		if err := conn.WriteMessage(websocket.BinaryMessage, bp2); err != nil {
+			return fmt.Errorf("ws write: %w", err)
+		}
+		ts += frameMS
+		framesSent++
+		// Skip pacing on the very first frame so TTFA is minimal.
+		if framesSent > 1 {
+			<-ticker.C
+		}
+		return nil
+	}
+
+	onChunk := func(samples []int16, srcRate int) error {
+		if firstChunkAt.IsZero() {
+			firstChunkAt = time.Now()
+			g.Log().Infof(ctx,
+				"tts stream first chunk  device_id=%s  ttfa_ms=%d  src_rate=%d  samples=%d",
+				sess.DeviceID, time.Since(t0).Milliseconds(), srcRate, len(samples),
+			)
+		}
+		resampled := Resample16(samples, srcRate, dstRate)
+		pcmAcc = append(pcmAcc, resampled...)
+
+		for len(pcmAcc) >= frameSamples {
+			frame := pcmAcc[:frameSamples]
+			pcmAcc = pcmAcc[frameSamples:]
+			if err := emit(frame); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	if err := SynthesizeSpeechStream(ctx, text, onChunk); err != nil {
+		// Best-effort tts:stop so the device doesn't sit in Speaking forever.
+		_ = conn.WriteJSON(map[string]string{"type": "tts", "state": "stop"})
+		return err
+	}
+
+	// Drain remainder: zero-pad to one final frame.
+	if len(pcmAcc) > 0 {
+		final := make([]int16, frameSamples)
+		copy(final, pcmAcc)
+		if err := emit(final); err != nil {
+			return err
+		}
+		pcmAcc = nil
+	}
+
+	if err := conn.WriteJSON(map[string]string{"type": "tts", "state": "stop"}); err != nil {
+		return err
+	}
+	g.Log().Infof(ctx,
+		"tts stream done  device_id=%s  total_ms=%d  duration=%dms  frames=%d",
+		sess.DeviceID, time.Since(t0).Milliseconds(), ts, framesSent,
+	)
 	return nil
 }

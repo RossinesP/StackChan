@@ -6,6 +6,7 @@ SPDX-License-Identifier: MIT
 package mistral_gateway
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -14,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -29,14 +31,16 @@ const mistralVoicesEndpoint = "https://api.mistral.ai/v1/audio/voices"
 // mistralTTSDefaultModel — Voxtral Mini TTS as of 2026.
 const mistralTTSDefaultModel = "voxtral-mini-tts-2603"
 
-// Note on the request shape: the API rejects `voice_id` even though the
-// docs JSON spec lists it; the actual field name is `voice`. We learned
-// this the hard way (status=400 "Either ref_audio or voice must be
-// provided" when sending voice_id).
+// Note on the request shape: the docs list `voice_id` but the
+// non-streaming endpoint historically required `voice`; the streaming
+// endpoint (added later) appears to honor `voice_id`. We send both —
+// it's the only combination that's worked across endpoint variants
+// without 400s or 500s.
 type ttsRequest struct {
 	Model          string `json:"model"`
 	Input          string `json:"input"`
 	Voice          string `json:"voice,omitempty"`
+	VoiceID        string `json:"voice_id,omitempty"`
 	RefAudio       string `json:"ref_audio,omitempty"`
 	ResponseFormat string `json:"response_format"`
 	Stream         bool   `json:"stream"`
@@ -173,6 +177,7 @@ func SynthesizeSpeech(ctx context.Context, text string) (*SynthesizedAudio, erro
 		Model:          firstNonEmpty(c.TTSModel, mistralTTSDefaultModel),
 		Input:          text,
 		Voice:          voice,
+		VoiceID:        voice,
 		ResponseFormat: "wav",
 		Stream:         false,
 	})
@@ -313,4 +318,206 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+// SSE event payloads emitted by Voxtral when stream=true. We only
+// care about audio.delta (per-chunk PCM) and audio.done (terminator).
+// Other events (errors, partial transcripts on round-trip models)
+// would need their own handling; we log+ignore unknown types.
+type sseAudioDelta struct {
+	Type      string `json:"type"`
+	AudioData string `json:"audio_data"` // base64-encoded raw PCM (float32 LE)
+}
+
+// SynthesizeSpeechStream calls Voxtral TTS in streaming mode and
+// invokes onChunk with each decoded PCM segment as it arrives.
+//
+// Streaming cuts perceived latency: the first onChunk fires after
+// ~500-800 ms (vs ~3 s for the buffered SynthesizeSpeech). The trade-off
+// is no peak normalization (we don't see the full waveform up front)
+// and a fixed sample rate assumption — see Config.MistralPCMSampleRate.
+//
+// Sample rate emitted by Voxtral when response_format="pcm" is not
+// documented; we observed 24 kHz when the same prompt is requested as
+// WAV. The response itself is float32 LE in [-1, +1], converted to
+// int16 mono by Float32LEToInt16.
+//
+// onChunk is called from this goroutine; it MUST NOT block on the
+// network read indefinitely or the API stream will stall (TCP backpressure).
+func SynthesizeSpeechStream(
+	ctx context.Context,
+	text string,
+	onChunk func(samples []int16, sampleRate int) error,
+) error {
+	c := Get()
+	if c.MistralAPIKey == "" {
+		return fmt.Errorf("MISTRAL_API_KEY not set")
+	}
+
+	voice, err := resolveVoice(ctx, c)
+	if err != nil {
+		return fmt.Errorf("resolve voice: %w", err)
+	}
+
+	body, err := json.Marshal(ttsRequest{
+		Model:          firstNonEmpty(c.TTSModel, mistralTTSDefaultModel),
+		Input:          text,
+		Voice:          voice,
+		VoiceID:        voice,
+		ResponseFormat: "pcm",
+		Stream:         true,
+	})
+	if err != nil {
+		return err
+	}
+
+	// No client-wide timeout: the stream may legitimately last several
+	// seconds. Rely on ctx for cancellation.
+	httpClient := &http.Client{}
+
+	// Single retry on transient 5xx. Voxtral occasionally returns
+	// `unreachable_backend` (status 500, code 1100) on the streaming
+	// endpoint; the same prompt typically succeeds on retry. We don't
+	// retry 4xx (validation / auth) since those won't change.
+	var resp *http.Response
+	for attempt := 0; attempt < 2; attempt++ {
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost,
+			mistralTTSEndpoint, bytes.NewReader(body))
+		if reqErr != nil {
+			return reqErr
+		}
+		req.Header.Set("Authorization", "Bearer "+c.MistralAPIKey)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "text/event-stream")
+
+		resp, err = httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("tts stream http: %w", err)
+		}
+		if resp.StatusCode == http.StatusOK {
+			break
+		}
+		// Read+log the body, then decide.
+		errBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if len(errBody) > 400 {
+			errBody = errBody[:400]
+		}
+		if attempt == 0 && resp.StatusCode >= 500 && resp.StatusCode < 600 {
+			// Transient; back off briefly and retry.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(400 * time.Millisecond):
+			}
+			continue
+		}
+		return fmt.Errorf("tts stream status=%d body=%s",
+			resp.StatusCode, string(errBody))
+	}
+	defer resp.Body.Close()
+
+	rate := c.MistralPCMSampleRate
+	if rate <= 0 {
+		rate = 24000
+	}
+
+	// SSE parser: read line-by-line. An event is delimited by a blank
+	// line, with "event: <type>" and "data: <json>" lines. Voxtral
+	// includes the type *inside* the data JSON too, so we don't strictly
+	// need the event line, but we honor it for correctness.
+	scanner := bufio.NewScanner(resp.Body)
+	// Default scanner buffer is 64 KiB; base64-encoded PCM chunks can
+	// exceed this for longer phrases. Bump to 1 MiB.
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	// Carry leftover bytes (incomplete float32) across chunks. In
+	// practice Voxtral aligns chunks on float32 boundaries, but the
+	// docs don't guarantee it — the carry buffer is cheap insurance.
+	var carry []byte
+
+	var (
+		eventType string
+		dataBuf   strings.Builder
+	)
+	flush := func() error {
+		if dataBuf.Len() == 0 {
+			eventType = ""
+			return nil
+		}
+		raw := dataBuf.String()
+		dataBuf.Reset()
+		defer func() { eventType = "" }()
+
+		// Determine type from event header OR from data envelope.
+		typ := eventType
+		if typ == "" {
+			var probe struct {
+				Type string `json:"type"`
+			}
+			_ = json.Unmarshal([]byte(raw), &probe)
+			typ = probe.Type
+		}
+
+		switch typ {
+		case "speech.audio.delta":
+			var delta sseAudioDelta
+			if err := json.Unmarshal([]byte(raw), &delta); err != nil {
+				return fmt.Errorf("sse delta json: %w", err)
+			}
+			pcmBytes, err := base64.StdEncoding.DecodeString(delta.AudioData)
+			if err != nil {
+				return fmt.Errorf("sse delta base64: %w", err)
+			}
+			if len(carry) > 0 {
+				pcmBytes = append(carry, pcmBytes...)
+				carry = nil
+			}
+			samples, consumed := Float32LEToInt16(pcmBytes)
+			if consumed < len(pcmBytes) {
+				carry = append(carry, pcmBytes[consumed:]...)
+			}
+			if len(samples) == 0 {
+				return nil
+			}
+			return onChunk(samples, rate)
+		case "speech.audio.done", "":
+			// Terminator (or empty data) — caller's outer loop will
+			// detect end via scanner.Scan returning false.
+			return nil
+		default:
+			// Ignore unknown event types; log at debug level if needed.
+			return nil
+		}
+	}
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			if err := flush(); err != nil {
+				return err
+			}
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "event: "):
+			eventType = strings.TrimPrefix(line, "event: ")
+		case strings.HasPrefix(line, "data: "):
+			if dataBuf.Len() > 0 {
+				dataBuf.WriteByte('\n')
+			}
+			dataBuf.WriteString(strings.TrimPrefix(line, "data: "))
+		case strings.HasPrefix(line, ":"):
+			// SSE comment / heartbeat; ignore.
+		}
+	}
+	// Flush trailing event without final blank line (some servers
+	// close the stream without it).
+	if err := flush(); err != nil {
+		return err
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("sse scan: %w", err)
+	}
+	return nil
 }

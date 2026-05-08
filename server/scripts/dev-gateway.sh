@@ -224,6 +224,14 @@ export GATEWAY_OPUS_VERSION="${GATEWAY_OPUS_VERSION:-2}"
 #   MISTRAL_STT_LANGUAGE (default: empty = auto-detect; e.g. "en", "fr")
 #   GATEWAY_STT_REPLY    (default: "You said: %s"; set to empty to fall
 #                          back to M4 static greeting)
+#
+# M6 (streaming TTS, default ON when API key is set):
+#   GATEWAY_TTS_STREAM   (default: true; set to "false" to use the M4
+#                          buffered WAV path instead — slower TTFA but
+#                          allows peak normalization)
+#   MISTRAL_TTS_PCM_RATE (default: 24000; sample rate Voxtral emits
+#                          in pcm/stream mode — change only if Mistral
+#                          documents a different default)
 
 # Point GoFrame at the dev config so utility/rsa.go finds RSA keys.
 export GF_GCFG_FILE="$DEV_CONFIG"
@@ -234,7 +242,8 @@ echo "  GATEWAY_WS_URL       = $GATEWAY_WS_URL"
 echo "  GATEWAY_OPUS_VERSION = $GATEWAY_OPUS_VERSION"
 echo "  GF_GCFG_FILE         = $GF_GCFG_FILE"
 if [[ -n "${MISTRAL_API_KEY:-}" ]]; then
-  echo "  MISTRAL_API_KEY      = sk-***${MISTRAL_API_KEY: -4} (M4 TTS enabled)"
+  stream_mode="${GATEWAY_TTS_STREAM:-true}"
+  echo "  MISTRAL_API_KEY      = sk-***${MISTRAL_API_KEY: -4} (TTS enabled, stream=$stream_mode)"
 else
   echo "  MISTRAL_API_KEY      = (unset → M3 echo loopback)"
 fi

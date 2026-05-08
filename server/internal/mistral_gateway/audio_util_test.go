@@ -8,6 +8,7 @@ package mistral_gateway
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 	"testing"
 )
 
@@ -181,6 +182,63 @@ func TestDecodeWAVStereoDownmix(t *testing.T) {
 		if s != 200 {
 			t.Errorf("pcm[%d] = %d, want 200 (stereo downmix)", i, s)
 		}
+	}
+}
+
+func TestFloat32LEToInt16Roundtrip(t *testing.T) {
+	// 4 floats: -1.0, -0.5, 0.5, 1.0 → -32767, -16383, 16383, 32767
+	floats := []float32{-1.0, -0.5, 0.5, 1.0}
+	buf := make([]byte, len(floats)*4)
+	for i, f := range floats {
+		binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(f))
+	}
+	samples, consumed := Float32LEToInt16(buf)
+	if consumed != len(buf) {
+		t.Fatalf("consumed = %d, want %d", consumed, len(buf))
+	}
+	if len(samples) != 4 {
+		t.Fatalf("samples = %d, want 4", len(samples))
+	}
+	want := []int16{-32767, -16383, 16383, 32767}
+	for i, w := range want {
+		// Allow off-by-one for rounding (no rounding in our impl, so should match).
+		if samples[i] != w {
+			t.Errorf("[%d] got %d, want %d", i, samples[i], w)
+		}
+	}
+}
+
+func TestFloat32LEToInt16Clamps(t *testing.T) {
+	// Values outside [-1, +1] must clamp to int16 max magnitudes.
+	floats := []float32{2.5, -3.0}
+	buf := make([]byte, len(floats)*4)
+	for i, f := range floats {
+		binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(f))
+	}
+	samples, _ := Float32LEToInt16(buf)
+	if samples[0] != 32767 {
+		t.Errorf("clamp+: got %d, want 32767", samples[0])
+	}
+	if samples[1] != -32767 {
+		t.Errorf("clamp-: got %d, want -32767", samples[1])
+	}
+}
+
+func TestFloat32LEToInt16PartialTrailing(t *testing.T) {
+	// 9 bytes = 2 complete floats + 1 trailing byte. Caller carries
+	// the leftover; we report consumed=8, samples=2.
+	floats := []float32{0.25, -0.25}
+	buf := make([]byte, len(floats)*4+1)
+	for i, f := range floats {
+		binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(f))
+	}
+	buf[8] = 0xAB // dangling byte
+	samples, consumed := Float32LEToInt16(buf)
+	if consumed != 8 {
+		t.Errorf("consumed = %d, want 8", consumed)
+	}
+	if len(samples) != 2 {
+		t.Fatalf("samples = %d, want 2", len(samples))
 	}
 }
 
