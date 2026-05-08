@@ -429,8 +429,28 @@ func playbackTranscribeAndReply(ctx context.Context, conn *websocket.Conn, sess 
 	)
 
 	if transcript == "" {
-		// Voxtral returned empty (silence or unintelligible) — say so.
-		return playbackTTS(ctx, conn, sess, "I didn't catch that.")
+		// Voxtral returned empty — silence, background noise, or
+		// just unintelligible audio. Stay quiet (no spoken filler)
+		// but we MUST still bracket with tts:start/stop, otherwise
+		// the device sits in its current "server processing" state
+		// forever and stops accepting new audio.
+		//
+		// Per firmware/xiaozhi-esp32/main/application.cc:524, the
+		// device's tts:stop handler only transitions out of
+		// kDeviceStateSpeaking — so without a preceding tts:start
+		// it's a no-op. Send both, with no audio between, and the
+		// device flicks Speaking → Listening (auto mode) cleanly.
+		g.Log().Infof(ctx,
+			"empty transcript, sending silent ack  device_id=%s",
+			sess.DeviceID)
+		if err := sess.WriteJSON(conn, map[string]string{
+			"type": "tts", "state": "start",
+		}); err != nil {
+			return err
+		}
+		return sess.WriteJSON(conn, map[string]string{
+			"type": "tts", "state": "stop",
+		})
 	}
 
 	reply := generateReplyText(ctx, sess, transcript)
