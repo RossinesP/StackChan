@@ -1,2 +1,5 @@
 .DS_Store
 .idea/
+
+# Server runtime logs
+server/logs/
