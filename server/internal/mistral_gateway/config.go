@@ -174,6 +174,13 @@ type Config struct {
 	// model. Default keeps replies short and audio-appropriate;
 	// %s is replaced with the question text.
 	VisionPromptWrapper string
+
+	// EmotionEnabled gates the M10 avatar-expression pipeline. When
+	// true (default), the gateway parses [emotion:NAME] tags out of
+	// the LLM reply and forwards them to the device as
+	// {type:"llm", emotion:NAME} events that drive the avatar's
+	// facial expression. The tag is stripped from the spoken text.
+	EmotionEnabled bool
 }
 
 var (
@@ -213,6 +220,13 @@ func Get() Config {
 					"When they ask what you can see or anything ABOUT the scene, "+
 					"pass their question as the question argument so you receive "+
 					"a description back. "+
+					"Emotion convention: PREFIX every reply with one tag "+
+					"[emotion:NAME] where NAME is one of: neutral, happy, "+
+					"laughing, sad, crying, angry, sleepy, doubtful. Pick the "+
+					"emotion that matches your reply's tone. The tag drives "+
+					"your face on the screen and is removed before being spoken. "+
+					"Examples: '[emotion:happy] Voilà, ma tête tourne à droite!' "+
+					"or '[emotion:doubtful] Hmm, je ne suis pas sûre.' "+
 					"Reply in 1-2 short spoken sentences — plain prose, no "+
 					"markdown, no lists, no code blocks, no emoji."),
 			ChatMaxTokens:    envInt("GATEWAY_CHAT_MAX_TOKENS", 200),
@@ -227,6 +241,7 @@ func Get() Config {
 			VisionPromptWrapper: envOr("GATEWAY_VISION_PROMPT",
 				"Look at this photo through StackChan's camera and answer briefly "+
 					"(1-2 short sentences) suitable for spoken reply. Question: %s"),
+			EmotionEnabled: envBool("GATEWAY_EMOTION_ENABLED", true),
 		}
 
 		// Blocklist resolution: when vision is OFF (or the API key is

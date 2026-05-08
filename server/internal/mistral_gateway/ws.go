@@ -515,6 +515,36 @@ func playbackTranscribeAndReply(ctx context.Context, conn *websocket.Conn, sess 
 	}
 
 	reply := generateReplyText(ctx, sess, transcript)
+
+	// Emotion extraction (M10): pull [emotion:NAME] out of the LLM
+	// reply, send it to the device as an `llm` event so the avatar
+	// face matches the spoken tone, and feed the cleaned text to TTS.
+	// Skip on echo / template paths — those don't have model-emitted
+	// emotion tags. The check is just "is the reply different from
+	// what came in?" — generateReplyText returns the raw transcript
+	// echo only when chat is off, in which case there's no tag to
+	// parse anyway and ExtractEmotion is a no-op.
+	if c.EmotionEnabled {
+		emotion, cleaned := ExtractEmotion(reply)
+		if emotion != "" {
+			if !IsValidEmotion(emotion) {
+				g.Log().Warningf(ctx,
+					"emotion %q not in firmware allowlist; device will fall back to neutral",
+					emotion)
+			}
+			g.Log().Infof(ctx,
+				"emotion device_id=%s  emotion=%s  reply_chars=%d",
+				sess.DeviceID, emotion, len(cleaned))
+			if err := sess.WriteJSON(conn, map[string]string{
+				"type":    "llm",
+				"emotion": emotion,
+			}); err != nil {
+				// Non-fatal: TTS still works without the avatar update.
+				g.Log().Warningf(ctx, "send llm/emotion failed: %v", err)
+			}
+			reply = cleaned
+		}
+	}
 	return playbackTTS(ctx, conn, sess, reply)
 }
 

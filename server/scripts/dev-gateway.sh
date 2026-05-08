@@ -264,6 +264,14 @@ export GATEWAY_OPUS_VERSION="${GATEWAY_OPUS_VERSION:-2}"
 #   GATEWAY_VISION_MAX_BYTES (default: 1048576 = 1 MB)
 #   GATEWAY_VISION_PROMPT    (default: short audio-friendly wrapper;
 #                              %s is replaced with the user's question)
+#
+# M10 (avatar emotion, default ON):
+#   GATEWAY_EMOTION_ENABLED  (default: true; the model PREFIXES every
+#                              reply with [emotion:NAME] which the
+#                              gateway strips and forwards to the
+#                              device's avatar. NAME ∈ neutral, happy,
+#                              laughing, sad, crying, angry, sleepy,
+#                              doubtful)
 
 # Point GoFrame at the dev config so utility/rsa.go finds RSA keys.
 export GF_GCFG_FILE="$DEV_CONFIG"
