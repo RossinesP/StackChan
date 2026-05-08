@@ -242,6 +242,17 @@ export GATEWAY_OPUS_VERSION="${GATEWAY_OPUS_VERSION:-2}"
 #   GATEWAY_CHAT_MAX_TOKENS   (default: 200 ≈ 15-25 spoken seconds)
 #   GATEWAY_CHAT_HISTORY      (default: 6 messages = last 3 exchanges;
 #                               set to 0 to disable per-session memory)
+#
+# M8 (MCP function-calling, default ON when chat is on and device
+# advertises features.mcp):
+#   GATEWAY_CHAT_TOOLS         (default: true; set to "false" to keep
+#                                 chat replies pure-conversational)
+#   GATEWAY_CHAT_TOOL_MAX_ITER (default: 3; cap on chat→tool→chat
+#                                 round-trips per user turn)
+#   GATEWAY_CHAT_TOOL_BLOCK    (default: "self.camera.take_photo";
+#                                 comma-separated tool names hidden
+#                                 from Mistral. Use "-" to expose
+#                                 every discovered tool.)
 
 # Point GoFrame at the dev config so utility/rsa.go finds RSA keys.
 export GF_GCFG_FILE="$DEV_CONFIG"

@@ -216,6 +216,66 @@ func (c *MCPClient) HandleResponse(payload []byte) (matched bool) {
 	return true
 }
 
+// toolCallContent is one element of the MCP tools/call result's
+// content[] array. We only consume text blocks — the spec also
+// supports image/blob, but the StackChan tools don't return those.
+type toolCallContent struct {
+	Type string `json:"type"`
+	Text string `json:"text,omitempty"`
+}
+
+// toolCallResult is the unwrapped `result` payload of a successful
+// tools/call response. `isError` distinguishes a legitimate "the tool
+// ran and rejected this input" from "the tool succeeded but the value
+// happens to look like an error" — important to feed back to the LLM
+// so it can recover.
+type toolCallResult struct {
+	Content []toolCallContent `json:"content"`
+	IsError bool              `json:"isError"`
+}
+
+// CallTool invokes one device-side MCP tool by name with the given
+// JSON arguments object, and returns the concatenated text content
+// the device produced. `isError` is true when the device set the
+// MCP result's isError flag — the caller (chat loop) feeds this
+// back to the LLM as part of the tool result so the model can
+// react accordingly.
+//
+// Per-call timeout defaults to 10 s (head-angle moves can take
+// 1-2 s; reminder creation is fast). Caller can shorten via ctx.
+func (c *MCPClient) CallTool(ctx context.Context, name string, args map[string]any) (text string, isError bool, err error) {
+	callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	if args == nil {
+		args = map[string]any{}
+	}
+	resp, err := c.Request(callCtx, "tools/call", map[string]any{
+		"name":      name,
+		"arguments": args,
+	})
+	if err != nil {
+		return "", false, err
+	}
+
+	var r toolCallResult
+	if err := json.Unmarshal(resp.Result, &r); err != nil {
+		return "", false, fmt.Errorf("tools/call result: %w", err)
+	}
+	// Concatenate every text block; non-text blocks become a
+	// human-readable placeholder so the model still sees them in
+	// the conversation log.
+	var sb []byte
+	for _, c := range r.Content {
+		if c.Type == "text" {
+			sb = append(sb, c.Text...)
+		} else {
+			sb = append(sb, "["+c.Type+"]"...)
+		}
+	}
+	return string(sb), r.IsError, nil
+}
+
 // ListTools issues `tools/list` requests until the device stops
 // returning a `nextCursor`, concatenating the pages. Pagination is
 // driven by the device's max-payload budget (8 KiB) — StackChan

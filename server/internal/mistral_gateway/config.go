@@ -15,6 +15,7 @@ package mistral_gateway
 import (
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -108,6 +109,32 @@ type Config struct {
 	// each request. 6 = last 3 exchanges. Keeps prompt cost bounded
 	// without losing immediate context.
 	ChatHistoryLimit int
+
+	// ChatToolsEnabled gates the M8b function-calling path. When true
+	// (the default with API key + chat enabled + MCP discovery), the
+	// gateway forwards the device's discovered MCP tools to chat
+	// completions and routes any tool_calls back through MCP. Disable
+	// to keep chat replies pure-conversational.
+	ChatToolsEnabled bool
+
+	// ChatToolMaxIter caps how many chat → tool_call → chat round-trips
+	// we permit per user turn. 3 covers most multi-step actions
+	// (e.g. get_head_angles → set_head_angles → confirm); the cap
+	// guards against runaway loops where the model keeps calling
+	// tools without converging.
+	ChatToolMaxIter int
+
+	// ChatToolBlocklist is a comma-separated list of MCP tool names
+	// that we filter OUT of the tool list sent to Mistral. Use this
+	// for tools the device exposes but the gateway can't fully
+	// support yet — e.g. self.camera.take_photo, which requires a
+	// vision-explain endpoint we don't run yet (the device captures
+	// the photo but the upload to explain_url fails, leading the
+	// model to apologize for being unable to take pictures).
+	//
+	// Default blocks take_photo; override with GATEWAY_CHAT_TOOL_BLOCK.
+	// Set to "-" (a single dash) to disable the blocklist entirely.
+	ChatToolBlocklist []string
 }
 
 var (
@@ -136,12 +163,18 @@ func Get() Config {
 			ChatEnabled:          envBool("GATEWAY_CHAT_ENABLED", true),
 			MistralChatModel:     envOr("MISTRAL_CHAT_MODEL", "mistral-small-latest"),
 			ChatSystemPrompt: envOr("GATEWAY_CHAT_SYSTEM",
-				"You are StackChan, a small friendly desktop robot. "+
-					"Reply briefly (1-2 short sentences) and warmly. "+
-					"Your output is spoken aloud, so use plain prose — no "+
+				"You are StackChan, a small friendly desktop robot with a "+
+					"physical body: a head you can move, an LED you can color, "+
+					"and reminders you can set. Use your tools to act on the "+
+					"world when the user asks for something physical. After a "+
+					"successful tool call, briefly confirm what you did. "+
+					"Reply in 1-2 short spoken sentences — plain prose, no "+
 					"markdown, no lists, no code blocks, no emoji."),
 			ChatMaxTokens:    envInt("GATEWAY_CHAT_MAX_TOKENS", 200),
 			ChatHistoryLimit: envInt("GATEWAY_CHAT_HISTORY", 6),
+			ChatToolsEnabled:  envBool("GATEWAY_CHAT_TOOLS", true),
+			ChatToolMaxIter:   envInt("GATEWAY_CHAT_TOOL_MAX_ITER", 3),
+			ChatToolBlocklist: parseBlocklist(envOr("GATEWAY_CHAT_TOOL_BLOCK", "self.camera.take_photo")),
 		}
 	})
 	return cfg
@@ -164,6 +197,26 @@ func envInt(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+// parseBlocklist splits a comma-separated string into a trimmed list
+// of tool names. The sentinel "-" disables the blocklist (returns
+// nil) so operators can opt into seeing every tool, even known-broken
+// ones (useful for debugging device behavior).
+func parseBlocklist(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "-" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func envBool(key string, def bool) bool {

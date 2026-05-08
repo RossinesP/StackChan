@@ -36,12 +36,19 @@ type Session struct {
 
 	// Tools is the cached result of `tools/list`, populated by an
 	// async discovery kicked off after hello-ack. Empty until the
-	// first successful response. M8b will pass these to chat
-	// completions; for now, M8a just logs them.
+	// first successful response. M8b passes these to chat completions
+	// when ChatToolsEnabled.
 	Tools     []Tool
 	ToolsMu   sync.RWMutex
 	ToolsErr  error
 	ToolsDone bool
+
+	// ReplyMu serializes calls to playbackReply. M8b moves playback
+	// off the WS read loop into a goroutine so MCP tool-call
+	// responses can arrive during the chat-tool round-trips. The
+	// mutex prevents two playbacks from interleaving if a flush
+	// fires while one is still in progress.
+	ReplyMu sync.Mutex
 
 	// listening is true between `listen state:start` and `listen state:stop`.
 	listening bool

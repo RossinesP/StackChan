@@ -207,9 +207,17 @@ func discoverTools(ctx context.Context, sess *Session) {
 	for i, t := range tools {
 		names[i] = t.Name
 	}
-	g.Log().Infof(ctx,
-		"mcp tools/list ok  device_id=%s  api_ms=%d  count=%d  tools=%v",
-		sess.DeviceID, time.Since(t0).Milliseconds(), len(tools), names)
+	blocked := Get().ChatToolBlocklist
+	if len(blocked) > 0 {
+		filtered := FilterTools(tools, blocked)
+		g.Log().Infof(ctx,
+			"mcp tools/list ok  device_id=%s  api_ms=%d  count=%d  exposed=%d  blocked=%v  tools=%v",
+			sess.DeviceID, time.Since(t0).Milliseconds(), len(tools), len(filtered), blocked, names)
+	} else {
+		g.Log().Infof(ctx,
+			"mcp tools/list ok  device_id=%s  api_ms=%d  count=%d  tools=%v",
+			sess.DeviceID, time.Since(t0).Milliseconds(), len(tools), names)
+	}
 }
 
 // runSession is the per-connection main loop. It reads frames forever
@@ -256,9 +264,7 @@ func handleJSON(ctx context.Context, conn *websocket.Conn, sess *Session, payloa
 			sess.StartListening()
 		case "stop":
 			sess.StopListening()
-			if err := playbackReply(ctx, conn, sess); err != nil {
-				g.Log().Errorf(ctx, "playback failed: %v", err)
-			}
+			triggerReply(ctx, conn, sess, "listen:stop")
 		}
 	case "mcp":
 		// Inbound MCP message — could be a response to one of our
@@ -330,10 +336,30 @@ func handleAudio(ctx context.Context, conn *websocket.Conn, sess *Session, paylo
 	// playback are ignored because IsListening() is now false.
 	if n >= echoFlushFrames {
 		sess.StopListening()
-		if err := playbackReply(ctx, conn, sess); err != nil {
-			g.Log().Errorf(ctx, "auto-flush playback: %v", err)
-		}
+		triggerReply(ctx, conn, sess, "auto-flush")
 	}
+}
+
+// triggerReply spawns playbackReply in a goroutine, serialized by
+// sess.ReplyMu. Two reasons to keep playback off the read loop:
+//
+//  1. M8b: the chat-tool loop sends MCP requests and waits on the
+//     response channel. The response arrives on the WS read loop,
+//     so the read loop MUST keep running while we wait.
+//  2. The device can send other JSON (`listen:detect`, `iot`, etc.)
+//     during a long reply; blocking the reader silently drops them.
+//
+// ReplyMu guarantees only one playback runs at a time per session.
+// If a second trigger arrives mid-playback (e.g. user taps screen
+// again), it queues behind the first and runs sequentially.
+func triggerReply(ctx context.Context, conn *websocket.Conn, sess *Session, source string) {
+	go func() {
+		sess.ReplyMu.Lock()
+		defer sess.ReplyMu.Unlock()
+		if err := playbackReply(ctx, conn, sess); err != nil {
+			g.Log().Errorf(ctx, "playback failed (%s): %v", source, err)
+		}
+	}()
 }
 
 // echoFlushFrames triggers loopback playback after this many buffered
@@ -412,24 +438,67 @@ func playbackTranscribeAndReply(ctx context.Context, conn *websocket.Conn, sess 
 }
 
 // generateReplyText produces the assistant reply text from the user's
-// transcript. Routes through Mistral chat when enabled, falling back
-// to the M5 template (or a generic "got it" if the template is empty
-// too) on chat failure.
+// transcript. Routes through Mistral chat when enabled. When tools
+// are also enabled AND the device has finished MCP discovery with at
+// least one tool, uses the M8b function-calling loop; otherwise the
+// plain M7 chat path. Falls back to the M5 template / "got it" on
+// chat failure.
 func generateReplyText(ctx context.Context, sess *Session, transcript string) string {
 	c := Get()
 	if c.ChatEnabled {
+		// Snapshot the tool list under the cached lock — discovery
+		// runs in a goroutine so the slice can grow concurrently.
+		// Apply the blocklist filter before forwarding to Mistral so
+		// the model never sees tools we can't service end-to-end.
+		var sessionTools []Tool
+		if c.ChatToolsEnabled {
+			sess.ToolsMu.RLock()
+			if sess.ToolsDone && len(sess.Tools) > 0 {
+				sessionTools = make([]Tool, len(sess.Tools))
+				copy(sessionTools, sess.Tools)
+			}
+			sess.ToolsMu.RUnlock()
+			sessionTools = FilterTools(sessionTools, c.ChatToolBlocklist)
+		}
+
 		t0 := time.Now()
 		hist := truncateHistory(sess.History, c.ChatHistoryLimit)
-		g.Log().Infof(ctx,
-			"chat request  device_id=%s  model=%s  history_msgs=%d  user=%q",
-			sess.DeviceID, c.MistralChatModel, len(hist), transcript,
+
+		var (
+			reply       string
+			calledTools []string
+			err         error
 		)
-		reply, err := GenerateReply(ctx, transcript, hist)
-		if err == nil && reply != "" {
+		if len(sessionTools) > 0 {
 			g.Log().Infof(ctx,
-				"chat response device_id=%s  api_ms=%d  reply=%q",
-				sess.DeviceID, time.Since(t0).Milliseconds(), reply,
+				"chat request  device_id=%s  model=%s  history_msgs=%d  tools=%d  max_iter=%d  user=%q",
+				sess.DeviceID, c.MistralChatModel, len(hist), len(sessionTools), c.ChatToolMaxIter, transcript,
 			)
+			tools := MapMCPToolsToMistral(sessionTools)
+			executor := &mcpToolExecutor{client: sess.MCP}
+			reply, calledTools, err = GenerateReplyWithTools(
+				ctx, transcript, hist, tools, executor, c.ChatToolMaxIter,
+			)
+		} else {
+			g.Log().Infof(ctx,
+				"chat request  device_id=%s  model=%s  history_msgs=%d  tools=0  user=%q",
+				sess.DeviceID, c.MistralChatModel, len(hist), transcript,
+			)
+			reply, err = GenerateReply(ctx, transcript, hist)
+		}
+
+		if err == nil && reply != "" {
+			if len(calledTools) > 0 {
+				g.Log().Infof(ctx,
+					"chat response device_id=%s  api_ms=%d  tools_called=%v  reply=%q",
+					sess.DeviceID, time.Since(t0).Milliseconds(), calledTools, reply,
+				)
+			} else {
+				g.Log().Infof(ctx,
+					"chat response device_id=%s  api_ms=%d  reply=%q",
+					sess.DeviceID, time.Since(t0).Milliseconds(), reply,
+				)
+			}
 			sess.AppendTurn(transcript, reply)
 			return reply
 		}

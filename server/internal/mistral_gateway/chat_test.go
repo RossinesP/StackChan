@@ -5,7 +5,12 @@ SPDX-License-Identifier: MIT
 
 package mistral_gateway
 
-import "testing"
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"testing"
+)
 
 func TestTruncateHistoryEmpty(t *testing.T) {
 	if got := truncateHistory(nil, 6); got != nil {
@@ -89,5 +94,163 @@ func TestAppendTurnShapeUserAssistantPair(t *testing.T) {
 	if hist[0].Content != "goodbye" || hist[1].Content != "see you" {
 		t.Errorf("got [%q, %q], want [goodbye, see you]",
 			hist[0].Content, hist[1].Content)
+	}
+}
+
+// stubExecutor records calls and returns canned responses. Used to
+// drive GenerateReplyWithTools without a live MCP device.
+type stubExecutor struct {
+	calls   []stubCall
+	results map[string]stubResult
+}
+
+type stubCall struct {
+	Name string
+	Args map[string]any
+}
+
+type stubResult struct {
+	Text    string
+	IsError bool
+	Err     error
+}
+
+func (s *stubExecutor) Execute(_ context.Context, name string, args map[string]any) (string, bool, error) {
+	s.calls = append(s.calls, stubCall{Name: name, Args: args})
+	if r, ok := s.results[name]; ok {
+		return r.Text, r.IsError, r.Err
+	}
+	return "ok", false, nil
+}
+
+func TestMapMCPToolsToMistralBasic(t *testing.T) {
+	tools := []Tool{
+		{
+			Name:        "self.robot.set_head_angles",
+			Description: "Adjust head",
+			InputSchema: json.RawMessage(`{"type":"object","properties":{"yaw":{"type":"integer"}}}`),
+		},
+	}
+	out := MapMCPToolsToMistral(tools)
+	if len(out) != 1 {
+		t.Fatalf("len = %d, want 1", len(out))
+	}
+	if out[0].Type != "function" {
+		t.Errorf("type = %q, want function", out[0].Type)
+	}
+	if out[0].Function.Name != "self.robot.set_head_angles" {
+		t.Errorf("name = %q", out[0].Function.Name)
+	}
+	// Schema must round-trip verbatim — no re-marshaling that could
+	// reorder keys or normalize whitespace.
+	if string(out[0].Function.Parameters) != `{"type":"object","properties":{"yaw":{"type":"integer"}}}` {
+		t.Errorf("parameters = %q", string(out[0].Function.Parameters))
+	}
+}
+
+func TestMapMCPToolsToMistralEmptySchema(t *testing.T) {
+	// Tools with no schema (zero-arg tools) must still get a valid
+	// permissive object schema, or Mistral rejects the request.
+	tools := []Tool{{Name: "self.robot.get_reminders"}}
+	out := MapMCPToolsToMistral(tools)
+	if len(out) != 1 {
+		t.Fatalf("len = %d, want 1", len(out))
+	}
+	if string(out[0].Function.Parameters) != `{"type":"object","properties":{}}` {
+		t.Errorf("empty-schema fallback = %q", string(out[0].Function.Parameters))
+	}
+}
+
+func TestMapMCPToolsToMistralEmpty(t *testing.T) {
+	if got := MapMCPToolsToMistral(nil); got != nil {
+		t.Errorf("nil → %v, want nil", got)
+	}
+	if got := MapMCPToolsToMistral([]Tool{}); got != nil {
+		t.Errorf("empty → %v, want nil", got)
+	}
+}
+
+func TestFilterToolsDropsBlocked(t *testing.T) {
+	tools := []Tool{
+		{Name: "self.robot.set_head_angles"},
+		{Name: "self.camera.take_photo"},
+		{Name: "self.robot.set_led_color"},
+	}
+	out := FilterTools(tools, []string{"self.camera.take_photo"})
+	if len(out) != 2 {
+		t.Fatalf("len = %d, want 2", len(out))
+	}
+	for _, tl := range out {
+		if tl.Name == "self.camera.take_photo" {
+			t.Error("blocked tool present in filtered output")
+		}
+	}
+}
+
+func TestFilterToolsEmptyBlocklist(t *testing.T) {
+	tools := []Tool{{Name: "a"}, {Name: "b"}}
+	if got := FilterTools(tools, nil); len(got) != 2 {
+		t.Errorf("nil blocklist should pass through, got %d", len(got))
+	}
+	if got := FilterTools(tools, []string{}); len(got) != 2 {
+		t.Errorf("empty blocklist should pass through, got %d", len(got))
+	}
+}
+
+func TestParseBlocklistVariants(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"", nil},
+		{"-", nil}, // sentinel = explicitly disabled
+		{"a", []string{"a"}},
+		{"a,b,c", []string{"a", "b", "c"}},
+		{"  a , b  ,c", []string{"a", "b", "c"}}, // whitespace trimmed
+		{"a,,b", []string{"a", "b"}},             // empty entries dropped
+	}
+	for _, tc := range cases {
+		got := parseBlocklist(tc.in)
+		if len(got) != len(tc.want) {
+			t.Errorf("%q → %v, want %v", tc.in, got, tc.want)
+			continue
+		}
+		for i, w := range tc.want {
+			if got[i] != w {
+				t.Errorf("%q[%d] = %q, want %q", tc.in, i, got[i], w)
+			}
+		}
+	}
+}
+
+// TestStubExecutorErrorPath confirms the Execute interface
+// distinguishes the three failure modes (transport error, isError
+// true, empty success) so the chat-loop tests can stub them.
+func TestStubExecutorErrorPath(t *testing.T) {
+	s := &stubExecutor{
+		results: map[string]stubResult{
+			"good":     {Text: "yaw=0,pitch=0"},
+			"bad_args": {IsError: true, Text: "invalid yaw"},
+			"down":     {Err: errors.New("device offline")},
+		},
+	}
+
+	text, isErr, err := s.Execute(context.Background(), "good", nil)
+	if err != nil || isErr || text != "yaw=0,pitch=0" {
+		t.Errorf("good: text=%q isErr=%t err=%v", text, isErr, err)
+	}
+
+	text, isErr, err = s.Execute(context.Background(), "bad_args", map[string]any{"yaw": -999})
+	if err != nil || !isErr || text != "invalid yaw" {
+		t.Errorf("bad_args: text=%q isErr=%t err=%v", text, isErr, err)
+	}
+
+	_, _, err = s.Execute(context.Background(), "down", nil)
+	if err == nil {
+		t.Error("down: want non-nil error")
+	}
+
+	if len(s.calls) != 3 {
+		t.Errorf("recorded %d calls, want 3", len(s.calls))
 	}
 }
