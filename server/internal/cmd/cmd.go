@@ -22,6 +22,7 @@ import (
 	"stackChan/internal/controller/user"
 	"stackChan/internal/controller/xiaozhi"
 	"stackChan/internal/middleware"
+	"stackChan/internal/mistral_gateway"
 	"stackChan/internal/web_socket"
 
 	"github.com/gogf/gf/v2/frame/g"
@@ -42,6 +43,13 @@ var (
 			s.Use(middleware.CORS)
 
 			s.BindHandler("/stackChan/ws", web_socket.Handler)
+
+			// Mistral gateway (Path A). Device hits POST /xiaozhi/ota/
+			// for discovery, then dials WSS /xiaozhi/v1/ for the audio
+			// session. See docs/architecture/08-local-dev-setup.md.
+			s.BindHandler("POST:/xiaozhi/ota/", mistral_gateway.OtaHandler)
+			s.BindHandler("/xiaozhi/v1/", mistral_gateway.WsHandler)
+			s.BindHandler("POST:/xiaozhi/vision/explain", mistral_gateway.VisionExplainHandler)
 
 			// heartBeat
 			boot.InitCron()
