@@ -249,10 +249,21 @@ export GATEWAY_OPUS_VERSION="${GATEWAY_OPUS_VERSION:-2}"
 #                                 chat replies pure-conversational)
 #   GATEWAY_CHAT_TOOL_MAX_ITER (default: 3; cap on chat→tool→chat
 #                                 round-trips per user turn)
-#   GATEWAY_CHAT_TOOL_BLOCK    (default: "self.camera.take_photo";
+#   GATEWAY_CHAT_TOOL_BLOCK    (default: "" when vision is enabled,
+#                                 "self.camera.take_photo" when off;
 #                                 comma-separated tool names hidden
 #                                 from Mistral. Use "-" to expose
 #                                 every discovered tool.)
+#
+# M9 (Mistral vision / photo handling, default ON when API key set):
+#   GATEWAY_VISION_ENABLED   (default: true)
+#   MISTRAL_VISION_MODEL     (default: mistral-medium-latest)
+#   GATEWAY_VISION_URL       (default: auto-derived from GATEWAY_WS_URL,
+#                              swap ws→http and append /xiaozhi/vision/explain)
+#   GATEWAY_PHOTO_DIR        (default: ./photos; empty disables saving)
+#   GATEWAY_VISION_MAX_BYTES (default: 1048576 = 1 MB)
+#   GATEWAY_VISION_PROMPT    (default: short audio-friendly wrapper;
+#                              %s is replaced with the user's question)
 
 # Point GoFrame at the dev config so utility/rsa.go finds RSA keys.
 export GF_GCFG_FILE="$DEV_CONFIG"
@@ -265,12 +276,20 @@ echo "  GF_GCFG_FILE         = $GF_GCFG_FILE"
 if [[ -n "${MISTRAL_API_KEY:-}" ]]; then
   stream_mode="${GATEWAY_TTS_STREAM:-true}"
   chat_mode="${GATEWAY_CHAT_ENABLED:-true}"
+  vision_mode="${GATEWAY_VISION_ENABLED:-true}"
   if [[ "$chat_mode" == "true" ]]; then
     chat_label="chat=on (${MISTRAL_CHAT_MODEL:-mistral-small-latest})"
   else
     chat_label="chat=off (template path)"
   fi
-  echo "  MISTRAL_API_KEY      = sk-***${MISTRAL_API_KEY: -4} (TTS stream=$stream_mode, $chat_label)"
+  if [[ "$vision_mode" == "true" ]]; then
+    photo_dir="${GATEWAY_PHOTO_DIR:-./photos}"
+    vision_label="vision=on (${MISTRAL_VISION_MODEL:-mistral-medium-latest}, photos→$photo_dir)"
+  else
+    vision_label="vision=off"
+  fi
+  echo "  MISTRAL_API_KEY      = sk-***${MISTRAL_API_KEY: -4}"
+  echo "                         TTS stream=$stream_mode | $chat_label | $vision_label"
 else
   echo "  MISTRAL_API_KEY      = (unset → M3 echo loopback)"
 fi

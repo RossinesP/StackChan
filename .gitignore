@@ -3,6 +3,7 @@
 
 # Server runtime logs
 server/logs/
+server/photos/
 
 # Server build artifacts
 server/stackChan

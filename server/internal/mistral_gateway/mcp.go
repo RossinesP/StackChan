@@ -276,6 +276,34 @@ func (c *MCPClient) CallTool(ctx context.Context, name string, args map[string]a
 	return string(sb), r.IsError, nil
 }
 
+// Initialize sends the MCP `initialize` request, which the device
+// uses to receive the gateway's capabilities — most importantly the
+// vision URL + token, which configures the camera's explain
+// endpoint (see firmware mcp_server.cc::ParseCapabilities).
+//
+// Capabilities is passed verbatim as `params.capabilities` in the
+// JSON-RPC request. We don't introspect the device's response
+// (`protocolVersion`, `serverInfo`) — it's informational only and
+// the device works with or without us reading it.
+//
+// Must be called BEFORE ListTools — the device may register
+// camera-related tools only when it sees a vision URL configured.
+// (StackChan doesn't gate today, but other boards might.)
+func (c *MCPClient) Initialize(ctx context.Context, capabilities map[string]any) error {
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	_, err := c.Request(callCtx, "initialize", map[string]any{
+		"protocolVersion": "2024-11-05",
+		"capabilities":    capabilities,
+		"clientInfo": map[string]any{
+			"name":    "stackchan-mistral-gateway",
+			"version": "0.9.0", // bump on protocol-affecting changes
+		},
+	})
+	return err
+}
+
 // ListTools issues `tools/list` requests until the device stops
 // returning a `nextCursor`, concatenating the pages. Pagination is
 // driven by the device's max-payload budget (8 KiB) — StackChan

@@ -50,6 +50,13 @@ type Session struct {
 	// fires while one is still in progress.
 	ReplyMu sync.Mutex
 
+	// VisionToken is a per-session bearer token sent to the device
+	// in MCP `initialize` (capabilities.vision.token) and verified
+	// on the /xiaozhi/vision/explain HTTP endpoint. 32 hex chars,
+	// generated at hello time, registered in the global token
+	// registry below; cleared on WS close.
+	VisionToken string
+
 	// listening is true between `listen state:start` and `listen state:stop`.
 	listening bool
 
@@ -95,6 +102,47 @@ func (s *Session) WriteBinary(conn *websocket.Conn, data []byte) error {
 	s.WriteMu.Lock()
 	defer s.WriteMu.Unlock()
 	return conn.WriteMessage(websocket.BinaryMessage, data)
+}
+
+// sessionTokenRegistry maps VisionToken → *Session so the HTTP
+// vision-explain handler can look up the calling session by the
+// Bearer token in the request header. We don't use the Device-Id
+// header for lookup because the token is strictly stronger
+// (32 random hex bytes vs a 12-char MAC).
+//
+// Registration happens in WsHandler after the hello-ack;
+// deregistration runs on WS close via defer.
+var sessionTokenRegistry sync.Map // string → *Session
+
+// RegisterSessionToken adds the session to the global token map so
+// the HTTP handler can find it. Safe to call from any goroutine.
+func RegisterSessionToken(token string, sess *Session) {
+	if token == "" {
+		return
+	}
+	sessionTokenRegistry.Store(token, sess)
+}
+
+// LookupSessionByToken returns the session that owns the given
+// VisionToken, or nil if none. Used by the vision-explain handler
+// to authorize incoming uploads.
+func LookupSessionByToken(token string) *Session {
+	if token == "" {
+		return nil
+	}
+	if v, ok := sessionTokenRegistry.Load(token); ok {
+		return v.(*Session)
+	}
+	return nil
+}
+
+// UnregisterSessionToken removes the session from the registry.
+// Called from WsHandler's defer after the WS closes.
+func UnregisterSessionToken(token string) {
+	if token == "" {
+		return
+	}
+	sessionTokenRegistry.Delete(token)
 }
 
 func (s *Session) StartListening() {

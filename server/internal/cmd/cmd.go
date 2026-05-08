@@ -49,6 +49,7 @@ var (
 			// session. See docs/architecture/08-local-dev-setup.md.
 			s.BindHandler("POST:/xiaozhi/ota/", mistral_gateway.OtaHandler)
 			s.BindHandler("/xiaozhi/v1/", mistral_gateway.WsHandler)
+			s.BindHandler("POST:/xiaozhi/vision/explain", mistral_gateway.VisionExplainHandler)
 
 			// heartBeat
 			boot.InitCron()

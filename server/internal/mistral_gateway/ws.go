@@ -94,8 +94,12 @@ func WsHandler(r *ghttp.Request) {
 		return
 	}
 	defer func() {
-		// Best-effort cleanup; codec has no Close in this binding.
-		_ = sess
+		// Best-effort cleanup. codec has no Close in this binding;
+		// session token must be removed from the global registry so
+		// later HTTP requests with this token are rejected.
+		if sess != nil {
+			UnregisterSessionToken(sess.VisionToken)
+		}
 	}()
 
 	runSession(ctx, conn, sess)
@@ -165,14 +169,30 @@ func exchangeHello(ctx context.Context, conn *websocket.Conn, deviceID string) (
 	_ = conn.SetReadDeadline(time.Time{})
 	g.Log().Infof(ctx, "hello-ack sent  device_id=%s  session_id=%s", deviceID, sess.ID)
 
-	// Kick off MCP tools/list discovery in the background. The device
-	// will send the response on the same WS, picked up by handleJSON
-	// below and routed through sess.MCP.HandleResponse. Discovery is
-	// purely informational in M8a — we log the tools and cache them on
-	// the session for M8b to consume.
+	// Kick off MCP setup (initialize + tools/list discovery) in the
+	// background. The device sends responses on the same WS, picked
+	// up by handleJSON and routed through sess.MCP.HandleResponse.
+	//
+	// Initialize MUST come before tools/list so the device has the
+	// vision URL configured before the model can call take_photo.
 	mcpFeature, _ := in.Features["mcp"].(bool)
 	if mcpFeature {
-		go discoverTools(context.Background(), sess)
+		// Generate per-session vision token here (synchronously, so
+		// it's available before the background goroutine reads it).
+		// Token must be registered BEFORE the device gets it via
+		// initialize, so the first HTTP request can succeed.
+		c := Get()
+		if c.VisionEnabled && c.MistralAPIKey != "" {
+			tok, err := generateVisionToken()
+			if err != nil {
+				g.Log().Warningf(ctx,
+					"vision token generation failed; vision disabled this session: %v", err)
+			} else {
+				sess.VisionToken = tok
+				RegisterSessionToken(tok, sess)
+			}
+		}
+		go setupMCP(context.Background(), sess)
 	} else {
 		g.Log().Infof(ctx,
 			"mcp discovery skipped  device_id=%s  features.mcp=%v",
@@ -180,6 +200,47 @@ func exchangeHello(ctx context.Context, conn *websocket.Conn, deviceID string) (
 	}
 
 	return sess, nil
+}
+
+// setupMCP runs the MCP handshake: initialize (with vision
+// capabilities, if enabled) then tools/list discovery. Errors at
+// either step are logged but not fatal — the device stays usable
+// for plain conversation even if MCP setup fails.
+func setupMCP(ctx context.Context, sess *Session) {
+	c := Get()
+
+	// Step 1: initialize with capabilities. Skip if vision is off
+	// or the URL can't be derived — sending an empty capabilities
+	// block is harmless but pointless.
+	if sess.VisionToken != "" {
+		visionURL := effectiveVisionURL(c)
+		if visionURL == "" {
+			g.Log().Warningf(ctx,
+				"vision url could not be derived from WSURL=%s; skipping initialize",
+				c.WSURL)
+		} else {
+			caps := map[string]any{
+				"vision": map[string]any{
+					"url":   visionURL,
+					"token": sess.VisionToken,
+				},
+			}
+			t0 := time.Now()
+			if err := sess.MCP.Initialize(ctx, caps); err != nil {
+				g.Log().Warningf(ctx,
+					"mcp initialize failed  device_id=%s  api_ms=%d: %v",
+					sess.DeviceID, time.Since(t0).Milliseconds(), err)
+				// Continue to discovery anyway — non-vision tools still work.
+			} else {
+				g.Log().Infof(ctx,
+					"mcp initialize ok  device_id=%s  api_ms=%d  vision_url=%s",
+					sess.DeviceID, time.Since(t0).Milliseconds(), visionURL)
+			}
+		}
+	}
+
+	// Step 2: discovery.
+	discoverTools(ctx, sess)
 }
 
 // discoverTools runs `tools/list` (with pagination) and caches the

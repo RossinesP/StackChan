@@ -127,14 +127,53 @@ type Config struct {
 	// ChatToolBlocklist is a comma-separated list of MCP tool names
 	// that we filter OUT of the tool list sent to Mistral. Use this
 	// for tools the device exposes but the gateway can't fully
-	// support yet — e.g. self.camera.take_photo, which requires a
-	// vision-explain endpoint we don't run yet (the device captures
-	// the photo but the upload to explain_url fails, leading the
-	// model to apologize for being unable to take pictures).
+	// support yet.
 	//
-	// Default blocks take_photo; override with GATEWAY_CHAT_TOOL_BLOCK.
-	// Set to "-" (a single dash) to disable the blocklist entirely.
+	// As of M9, take_photo IS supported when VisionEnabled (the
+	// default with API key); when vision is disabled, take_photo is
+	// auto-added to the blocklist by Get() so it never reaches the
+	// model. Operators can append more entries via
+	// GATEWAY_CHAT_TOOL_BLOCK; "-" disables blocking entirely.
 	ChatToolBlocklist []string
+
+	// VisionEnabled gates the M9 photo / image-explain pipeline.
+	// When true (default with API key), the gateway:
+	//   - sends MCP `initialize` with capabilities.vision = {url, token}
+	//     so the device's take_photo tool knows where to upload JPEGs
+	//   - exposes POST /xiaozhi/vision/explain to receive uploads
+	//   - saves photos to PhotoDir
+	//   - calls MistralVisionModel for non-empty questions
+	// When false, take_photo is auto-blocked from the chat tool list.
+	VisionEnabled bool
+
+	// MistralVisionModel — chat completions model used for image
+	// understanding. mistral-medium-latest is multimodal and gives
+	// good descriptions; pixtral-large-latest is a heavier alternative.
+	MistralVisionModel string
+
+	// VisionExplainURL is the URL the device POSTs JPEGs to. Empty
+	// means "auto-derive from WSURL" (swap ws→http / wss→https,
+	// replace path with /xiaozhi/vision/explain). Override via
+	// GATEWAY_VISION_URL when running behind a reverse proxy or
+	// custom routing.
+	VisionExplainURL string
+
+	// PhotoDir is where saved JPEGs land. "./photos" lives in the
+	// repo so you can browse them in your editor; gitignored. Empty
+	// disables saving (the gateway still serves the explain endpoint
+	// but doesn't persist anything).
+	PhotoDir string
+
+	// VisionMaxImageBytes caps the size of an inbound JPEG. The
+	// ESP32 camera produces ~30-80 KB at 320×240; 1 MB is a generous
+	// safety bound that defends against accidental misuse. Larger
+	// uploads get HTTP 413.
+	VisionMaxImageBytes int
+
+	// VisionPromptWrapper frames the user's question for the vision
+	// model. Default keeps replies short and audio-appropriate;
+	// %s is replaced with the question text.
+	VisionPromptWrapper string
 }
 
 var (
@@ -165,17 +204,41 @@ func Get() Config {
 			ChatSystemPrompt: envOr("GATEWAY_CHAT_SYSTEM",
 				"You are StackChan, a small friendly desktop robot with a "+
 					"physical body: a head you can move, an LED you can color, "+
-					"and reminders you can set. Use your tools to act on the "+
-					"world when the user asks for something physical. After a "+
-					"successful tool call, briefly confirm what you did. "+
+					"a camera you can use, and reminders you can set. Use your "+
+					"tools to act on the world when the user asks for something "+
+					"physical. After a successful tool call, briefly confirm "+
+					"what you did. "+
+					"Camera convention: when the user asks you to JUST take or "+
+					"save a photo, call take_photo with question=\"\" (empty). "+
+					"When they ask what you can see or anything ABOUT the scene, "+
+					"pass their question as the question argument so you receive "+
+					"a description back. "+
 					"Reply in 1-2 short spoken sentences — plain prose, no "+
 					"markdown, no lists, no code blocks, no emoji."),
 			ChatMaxTokens:    envInt("GATEWAY_CHAT_MAX_TOKENS", 200),
 			ChatHistoryLimit: envInt("GATEWAY_CHAT_HISTORY", 6),
-			ChatToolsEnabled:  envBool("GATEWAY_CHAT_TOOLS", true),
-			ChatToolMaxIter:   envInt("GATEWAY_CHAT_TOOL_MAX_ITER", 3),
-			ChatToolBlocklist: parseBlocklist(envOr("GATEWAY_CHAT_TOOL_BLOCK", "self.camera.take_photo")),
+			ChatToolsEnabled:    envBool("GATEWAY_CHAT_TOOLS", true),
+			ChatToolMaxIter:     envInt("GATEWAY_CHAT_TOOL_MAX_ITER", 3),
+			VisionEnabled:       envBool("GATEWAY_VISION_ENABLED", true),
+			MistralVisionModel:  envOr("MISTRAL_VISION_MODEL", "mistral-medium-latest"),
+			VisionExplainURL:    os.Getenv("GATEWAY_VISION_URL"),
+			PhotoDir:            envOr("GATEWAY_PHOTO_DIR", "./photos"),
+			VisionMaxImageBytes: envInt("GATEWAY_VISION_MAX_BYTES", 1024*1024),
+			VisionPromptWrapper: envOr("GATEWAY_VISION_PROMPT",
+				"Look at this photo through StackChan's camera and answer briefly "+
+					"(1-2 short sentences) suitable for spoken reply. Question: %s"),
 		}
+
+		// Blocklist resolution: when vision is OFF (or the API key is
+		// missing — implies no vision either), auto-block take_photo
+		// since the device upload would fail. Operator can override
+		// either way via GATEWAY_CHAT_TOOL_BLOCK.
+		visionUsable := cfg.VisionEnabled && cfg.MistralAPIKey != ""
+		defaultBlock := ""
+		if !visionUsable {
+			defaultBlock = "self.camera.take_photo"
+		}
+		cfg.ChatToolBlocklist = parseBlocklist(envOr("GATEWAY_CHAT_TOOL_BLOCK", defaultBlock))
 	})
 	return cfg
 }
