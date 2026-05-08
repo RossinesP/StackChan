@@ -56,13 +56,15 @@ type audioParams struct {
 }
 
 // inboundJSON is a partial decode used to dispatch on `type` without
-// committing to a single concrete shape.
+// committing to a single concrete shape. MCP messages carry a Payload
+// field which is the JSON-RPC body forwarded to MCPClient.
 type inboundJSON struct {
-	Type      string `json:"type"`
-	State     string `json:"state,omitempty"`     // listen: start|stop|detect
-	Mode      string `json:"mode,omitempty"`      // listen: auto|manual|realtime
-	Text      string `json:"text,omitempty"`      // listen detect: wake word
-	SessionID string `json:"session_id,omitempty"`
+	Type      string          `json:"type"`
+	State     string          `json:"state,omitempty"`     // listen: start|stop|detect
+	Mode      string          `json:"mode,omitempty"`      // listen: auto|manual|realtime
+	Text      string          `json:"text,omitempty"`      // listen detect: wake word
+	SessionID string          `json:"session_id,omitempty"`
+	Payload   json.RawMessage `json:"payload,omitempty"`   // mcp: JSON-RPC body
 }
 
 // WsHandler implements WSS /xiaozhi/v1/. M3 milestone: hello echo,
@@ -142,6 +144,7 @@ func exchangeHello(ctx context.Context, conn *websocket.Conn, deviceID string) (
 		BP2Version: uint16(Get().OpusVersion),
 		Codec:      codec,
 	}
+	sess.MCP = NewMCPClient(conn, sess.ID, &sess.WriteMu)
 
 	out := helloOut{
 		Type:      "hello",
@@ -152,13 +155,61 @@ func exchangeHello(ctx context.Context, conn *websocket.Conn, deviceID string) (
 			FrameDuration: frameMS,
 		},
 	}
-	if err := conn.WriteJSON(out); err != nil {
-		return nil, err
+	sess.WriteMu.Lock()
+	wErr := conn.WriteJSON(out)
+	sess.WriteMu.Unlock()
+	if wErr != nil {
+		return nil, wErr
 	}
 
 	_ = conn.SetReadDeadline(time.Time{})
 	g.Log().Infof(ctx, "hello-ack sent  device_id=%s  session_id=%s", deviceID, sess.ID)
+
+	// Kick off MCP tools/list discovery in the background. The device
+	// will send the response on the same WS, picked up by handleJSON
+	// below and routed through sess.MCP.HandleResponse. Discovery is
+	// purely informational in M8a — we log the tools and cache them on
+	// the session for M8b to consume.
+	mcpFeature, _ := in.Features["mcp"].(bool)
+	if mcpFeature {
+		go discoverTools(context.Background(), sess)
+	} else {
+		g.Log().Infof(ctx,
+			"mcp discovery skipped  device_id=%s  features.mcp=%v",
+			deviceID, in.Features["mcp"])
+	}
+
 	return sess, nil
+}
+
+// discoverTools runs `tools/list` (with pagination) and caches the
+// result on the session. Errors are logged but not fatal — the device
+// stays usable for plain conversation even if MCP discovery fails.
+func discoverTools(ctx context.Context, sess *Session) {
+	t0 := time.Now()
+	listCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	tools, err := sess.MCP.ListTools(listCtx)
+	sess.ToolsMu.Lock()
+	sess.Tools = tools
+	sess.ToolsErr = err
+	sess.ToolsDone = true
+	sess.ToolsMu.Unlock()
+
+	if err != nil {
+		g.Log().Warningf(ctx,
+			"mcp tools/list failed  device_id=%s  api_ms=%d: %v",
+			sess.DeviceID, time.Since(t0).Milliseconds(), err)
+		return
+	}
+	names := make([]string, len(tools))
+	for i, t := range tools {
+		names[i] = t.Name
+	}
+	g.Log().Infof(ctx,
+		"mcp tools/list ok  device_id=%s  api_ms=%d  count=%d  tools=%v",
+		sess.DeviceID, time.Since(t0).Milliseconds(), len(tools), names)
 }
 
 // runSession is the per-connection main loop. It reads frames forever
@@ -208,6 +259,22 @@ func handleJSON(ctx context.Context, conn *websocket.Conn, sess *Session, payloa
 			if err := playbackReply(ctx, conn, sess); err != nil {
 				g.Log().Errorf(ctx, "playback failed: %v", err)
 			}
+		}
+	case "mcp":
+		// Inbound MCP message — could be a response to one of our
+		// outstanding requests (tools/list, tools/call), or a
+		// notification the device pushed unprompted (rare; the device
+		// is the MCP server, not a notification source we expect).
+		// Route by JSON-RPC ID; unmatched IDs are dropped silently.
+		if sess.MCP == nil || len(msg.Payload) == 0 {
+			g.Log().Debugf(ctx, "mcp inbound ignored (mcp=%t payload=%dB)",
+				sess.MCP != nil, len(msg.Payload))
+			return
+		}
+		if !sess.MCP.HandleResponse(msg.Payload) {
+			g.Log().Debugf(ctx,
+				"mcp inbound unmatched  device_id=%s  payload=%s",
+				sess.DeviceID, string(msg.Payload))
 		}
 	}
 }
@@ -473,10 +540,10 @@ func streamFramesAsTTS(conn *websocket.Conn, sess *Session, label string, frames
 	if len(frames) == 0 {
 		return nil
 	}
-	if err := conn.WriteJSON(map[string]string{"type": "tts", "state": "start"}); err != nil {
+	if err := sess.WriteJSON(conn, map[string]string{"type": "tts", "state": "start"}); err != nil {
 		return err
 	}
-	if err := conn.WriteJSON(map[string]string{
+	if err := sess.WriteJSON(conn, map[string]string{
 		"type": "tts", "state": "sentence_start", "text": label,
 	}); err != nil {
 		return err
@@ -492,7 +559,7 @@ func streamFramesAsTTS(conn *websocket.Conn, sess *Session, label string, frames
 	var ts uint32
 	for i, f := range frames {
 		bp2 := EncodeBP2(sess.BP2Version, BP2TypeOpus, ts, f)
-		if err := conn.WriteMessage(websocket.BinaryMessage, bp2); err != nil {
+		if err := sess.WriteBinary(conn, bp2); err != nil {
 			return err
 		}
 		ts += frameMS
@@ -503,7 +570,7 @@ func streamFramesAsTTS(conn *websocket.Conn, sess *Session, label string, frames
 		}
 	}
 
-	if err := conn.WriteJSON(map[string]string{"type": "tts", "state": "stop"}); err != nil {
+	if err := sess.WriteJSON(conn, map[string]string{"type": "tts", "state": "stop"}); err != nil {
 		return err
 	}
 	g.Log().Infof(context.Background(),
@@ -553,12 +620,12 @@ func playbackTTSStream(ctx context.Context, conn *websocket.Conn, sess *Session,
 	g.Log().Infof(ctx, "tts stream req  device_id=%s  voice=%s  text=%q",
 		sess.DeviceID, voiceHint, text)
 
-	if err := conn.WriteJSON(map[string]string{
+	if err := sess.WriteJSON(conn, map[string]string{
 		"type": "tts", "state": "start",
 	}); err != nil {
 		return fmt.Errorf("write tts:start: %w", err)
 	}
-	if err := conn.WriteJSON(map[string]string{
+	if err := sess.WriteJSON(conn, map[string]string{
 		"type": "tts", "state": "sentence_start", "text": text,
 	}); err != nil {
 		return fmt.Errorf("write sentence_start: %w", err)
@@ -591,7 +658,7 @@ func playbackTTSStream(ctx context.Context, conn *websocket.Conn, sess *Session,
 		cp := make([]byte, len(opusFrame))
 		copy(cp, opusFrame)
 		bp2 := EncodeBP2(sess.BP2Version, BP2TypeOpus, ts, cp)
-		if err := conn.WriteMessage(websocket.BinaryMessage, bp2); err != nil {
+		if err := sess.WriteBinary(conn, bp2); err != nil {
 			return fmt.Errorf("ws write: %w", err)
 		}
 		ts += frameMS
@@ -626,7 +693,7 @@ func playbackTTSStream(ctx context.Context, conn *websocket.Conn, sess *Session,
 
 	if err := SynthesizeSpeechStream(ctx, text, onChunk); err != nil {
 		// Best-effort tts:stop so the device doesn't sit in Speaking forever.
-		_ = conn.WriteJSON(map[string]string{"type": "tts", "state": "stop"})
+		_ = sess.WriteJSON(conn, map[string]string{"type": "tts", "state": "stop"})
 		return err
 	}
 
@@ -640,7 +707,7 @@ func playbackTTSStream(ctx context.Context, conn *websocket.Conn, sess *Session,
 		pcmAcc = nil
 	}
 
-	if err := conn.WriteJSON(map[string]string{"type": "tts", "state": "stop"}); err != nil {
+	if err := sess.WriteJSON(conn, map[string]string{"type": "tts", "state": "stop"}); err != nil {
 		return err
 	}
 	g.Log().Infof(ctx,

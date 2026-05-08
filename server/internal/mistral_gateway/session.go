@@ -5,20 +5,43 @@ SPDX-License-Identifier: MIT
 
 package mistral_gateway
 
+import (
+	"sync"
+
+	"github.com/gorilla/websocket"
+)
+
 // Session is the per-WebSocket-connection state. One instance per
 // connected device; lives for the duration of WsHandler's call.
 //
-// M3 scope: just enough to do audio loopback — buffer the user's
-// re-encoded opus while listening, then play it back as TTS when the
-// device sends `listen state:stop`.
-//
-// M4+ will extend this with: STT stream handle, LLM message history,
-// MCP tools list, TTS synthesizer state.
+// Grew through milestones: M3 added audio buffers; M5 added PCM for
+// STT; M7 added chat history; M8a adds MCP discovery state and a
+// shared write mutex (multiple goroutines now write to the WS — the
+// playback path AND the MCP request path — and gorilla/websocket
+// requires writes to be serialized).
 type Session struct {
 	ID          string
 	DeviceID    string
 	BP2Version  uint16
 	Codec       *OpusCodec
+
+	// WriteMu serializes ALL conn.WriteMessage / conn.WriteJSON calls.
+	// Hand it to MCPClient on construction; hold it around any direct
+	// write from playback or other goroutines.
+	WriteMu sync.Mutex
+
+	// MCP coordinates JSON-RPC requests to the device's MCP server.
+	// Initialized in WsHandler after the hello exchange.
+	MCP *MCPClient
+
+	// Tools is the cached result of `tools/list`, populated by an
+	// async discovery kicked off after hello-ack. Empty until the
+	// first successful response. M8b will pass these to chat
+	// completions; for now, M8a just logs them.
+	Tools     []Tool
+	ToolsMu   sync.RWMutex
+	ToolsErr  error
+	ToolsDone bool
 
 	// listening is true between `listen state:start` and `listen state:stop`.
 	listening bool
@@ -47,6 +70,24 @@ func (s *Session) AppendTurn(userText, assistantText string) {
 		ChatMessage{Role: RoleAssistant, Content: assistantText},
 	)
 	s.History = truncateHistory(s.History, Get().ChatHistoryLimit)
+}
+
+// WriteJSON sends a JSON frame to the device with WriteMu held. Use
+// from any goroutine (playback, MCP, hello). Blocks if another
+// writer is in the middle of streaming TTS — that's intentional and
+// keeps the WS frame stream well-formed.
+func (s *Session) WriteJSON(conn *websocket.Conn, v any) error {
+	s.WriteMu.Lock()
+	defer s.WriteMu.Unlock()
+	return conn.WriteJSON(v)
+}
+
+// WriteBinary sends a binary WS frame to the device with WriteMu
+// held. Used for opus payloads (BP2-framed).
+func (s *Session) WriteBinary(conn *websocket.Conn, data []byte) error {
+	s.WriteMu.Lock()
+	defer s.WriteMu.Unlock()
+	return conn.WriteMessage(websocket.BinaryMessage, data)
 }
 
 func (s *Session) StartListening() {
