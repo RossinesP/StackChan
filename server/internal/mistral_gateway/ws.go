@@ -6,6 +6,7 @@ SPDX-License-Identifier: MIT
 package mistral_gateway
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -53,12 +54,19 @@ type audioParams struct {
 	FrameDuration int    `json:"frame_duration"`
 }
 
-// WsHandler implements WSS /xiaozhi/v1/. M2 milestone: upgrade,
-// exchange hello, hold the connection open, log inbound frames.
-//
-// M3 (audio loopback), M4–M6 (TTS / STT / LLM), and M7+ (MCP tools)
-// will land in sibling files: framing.go, opus.go, stt.go, tts.go,
-// llm.go, mcp.go.
+// inboundJSON is a partial decode used to dispatch on `type` without
+// committing to a single concrete shape.
+type inboundJSON struct {
+	Type      string `json:"type"`
+	State     string `json:"state,omitempty"`     // listen: start|stop|detect
+	Mode      string `json:"mode,omitempty"`      // listen: auto|manual|realtime
+	Text      string `json:"text,omitempty"`      // listen detect: wake word
+	SessionID string `json:"session_id,omitempty"`
+}
+
+// WsHandler implements WSS /xiaozhi/v1/. M3 milestone: hello echo,
+// then per-frame opus loopback (decode → re-encode → buffer → on
+// `listen state:stop`, replay as a TTS response).
 func WsHandler(r *ghttp.Request) {
 	ctx := r.Context()
 	deviceID := r.Header.Get("Device-Id")
@@ -77,25 +85,27 @@ func WsHandler(r *ghttp.Request) {
 	}
 	defer conn.Close()
 
-	if err := exchangeHello(ctx, conn, deviceID); err != nil {
+	sess, err := exchangeHello(ctx, conn, deviceID)
+	if err != nil {
 		g.Log().Warningf(ctx, "ws hello failed device_id=%s: %v", deviceID, err)
 		return
 	}
+	defer func() {
+		// Best-effort cleanup; codec has no Close in this binding.
+		_ = sess
+	}()
 
-	// M2 stops here: keep the connection alive and log every frame so
-	// you can verify the device is happy with the handshake. Replace
-	// with the per-session state machine in M3+.
-	readLoop(ctx, conn, deviceID)
+	runSession(ctx, conn, sess)
 }
 
-func exchangeHello(ctx g.Ctx, conn *websocket.Conn, deviceID string) error {
+func exchangeHello(ctx context.Context, conn *websocket.Conn, deviceID string) (*Session, error) {
 	if err := conn.SetReadDeadline(time.Now().Add(helloTimeout)); err != nil {
-		return err
+		return nil, err
 	}
 
 	mt, payload, err := conn.ReadMessage()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if mt != websocket.TextMessage {
 		g.Log().Warningf(ctx, "ws first frame not text (type=%d)", mt)
@@ -103,53 +113,198 @@ func exchangeHello(ctx g.Ctx, conn *websocket.Conn, deviceID string) error {
 
 	var in helloIn
 	if err := json.Unmarshal(payload, &in); err != nil {
-		return err
+		return nil, err
 	}
 	if in.Type != "hello" {
 		g.Log().Warningf(ctx, "ws first message type=%q (expected hello)", in.Type)
 	}
+
+	rate := in.AudioParams.SampleRate
+	frameMS := in.AudioParams.FrameDuration
+	channels := in.AudioParams.Channels
+	if channels == 0 {
+		channels = 1
+	}
 	g.Log().Infof(ctx,
-		"hello in  device_id=%s  format=%s  rate=%d  frame=%dms  features=%v",
-		deviceID,
-		in.AudioParams.Format, in.AudioParams.SampleRate, in.AudioParams.FrameDuration,
-		in.Features,
+		"hello in  device_id=%s  format=%s  rate=%d  frame=%dms  channels=%d  features=%v",
+		deviceID, in.AudioParams.Format, rate, frameMS, channels, in.Features,
 	)
+
+	codec, err := NewOpusCodec(rate, frameMS, channels)
+	if err != nil {
+		return nil, err
+	}
+
+	sess := &Session{
+		ID:         uuid.NewString(),
+		DeviceID:   deviceID,
+		BP2Version: uint16(Get().OpusVersion),
+		Codec:      codec,
+	}
 
 	out := helloOut{
 		Type:      "hello",
 		Transport: "websocket",
-		SessionID: uuid.NewString(),
+		SessionID: sess.ID,
 		AudioParams: audioParams{
-			SampleRate:    in.AudioParams.SampleRate,
-			FrameDuration: in.AudioParams.FrameDuration,
+			SampleRate:    rate,
+			FrameDuration: frameMS,
 		},
 	}
 	if err := conn.WriteJSON(out); err != nil {
-		return err
+		return nil, err
 	}
 
-	// Clear the hello deadline; the read loop manages its own timeouts.
 	_ = conn.SetReadDeadline(time.Time{})
-	g.Log().Infof(ctx, "hello-ack sent  device_id=%s  session_id=%s", deviceID, out.SessionID)
-	return nil
+	g.Log().Infof(ctx, "hello-ack sent  device_id=%s  session_id=%s", deviceID, sess.ID)
+	return sess, nil
 }
 
-func readLoop(ctx g.Ctx, conn *websocket.Conn, deviceID string) {
+// runSession is the per-connection main loop. It reads frames forever
+// (until the WS closes) and dispatches:
+//   - text JSON  → handleJSON  (listen start/stop, etc.)
+//   - binary BP2 → handleAudio (decode, re-encode, buffer)
+func runSession(ctx context.Context, conn *websocket.Conn, sess *Session) {
 	for {
 		mt, payload, err := conn.ReadMessage()
 		if err != nil {
-			g.Log().Infof(ctx, "ws closed  device_id=%s: %v", deviceID, err)
+			g.Log().Infof(ctx, "ws closed  device_id=%s: %v", sess.DeviceID, err)
 			return
 		}
 		switch mt {
 		case websocket.TextMessage:
-			g.Log().Debugf(ctx, "ws<- text  device_id=%s  bytes=%d  body=%s",
-				deviceID, len(payload), string(payload))
+			handleJSON(ctx, conn, sess, payload)
 		case websocket.BinaryMessage:
-			// M3 will decode this with framing.go.
-			g.Log().Debugf(ctx, "ws<- bin   device_id=%s  bytes=%d", deviceID, len(payload))
+			handleAudio(ctx, conn, sess, payload)
 		default:
-			g.Log().Debugf(ctx, "ws<- other device_id=%s  type=%d  bytes=%d", deviceID, mt, len(payload))
+			g.Log().Debugf(ctx, "ws<- other type=%d bytes=%d", mt, len(payload))
 		}
 	}
+}
+
+func handleJSON(ctx context.Context, conn *websocket.Conn, sess *Session, payload []byte) {
+	var msg inboundJSON
+	if err := json.Unmarshal(payload, &msg); err != nil {
+		g.Log().Warningf(ctx, "ws<- text invalid json: %v body=%s", err, string(payload))
+		return
+	}
+	g.Log().Debugf(ctx,
+		"ws<- text  type=%s  state=%s  mode=%s",
+		msg.Type, msg.State, msg.Mode,
+	)
+
+	switch msg.Type {
+	case "listen":
+		switch msg.State {
+		case "start":
+			sess.StartListening()
+		case "detect":
+			// Wake-word event; treat like listen start so we capture
+			// any subsequent audio.
+			sess.StartListening()
+		case "stop":
+			sess.StopListening()
+			if err := playbackEcho(ctx, conn, sess); err != nil {
+				g.Log().Errorf(ctx, "playback failed: %v", err)
+			}
+		}
+	}
+}
+
+func handleAudio(ctx context.Context, conn *websocket.Conn, sess *Session, payload []byte) {
+	frame, err := DecodeBP2(payload)
+	if err != nil {
+		g.Log().Warningf(ctx, "bp2 decode failed: %v (bytes=%d, hex=% x...)",
+			err, len(payload), payload[:min(8, len(payload))])
+		return
+	}
+	if frame.Type != BP2TypeOpus {
+		g.Log().Debugf(ctx, "bp2<- non-opus type=%d skip", frame.Type)
+		return
+	}
+	if !sess.IsListening() {
+		// Audio outside a listening window — the device can stream
+		// briefly during state transitions; ignore silently.
+		return
+	}
+
+	pcm, err := sess.Codec.Decode(frame.Payload)
+	if err != nil {
+		g.Log().Warningf(ctx, "opus decode failed: %v (bytes=%d)", err, len(frame.Payload))
+		return
+	}
+	reEncoded, err := sess.Codec.Encode(pcm)
+	if err != nil {
+		g.Log().Warningf(ctx, "opus re-encode failed: %v (samples=%d)", err, len(pcm))
+		return
+	}
+	sess.BufferEcho(reEncoded)
+
+	// Heartbeat log every 50 frames (~3 s of audio) so the operator
+	// sees the stream is flowing without spamming per-frame.
+	n := len(sess.echoBuf)
+	if n == 1 || n%50 == 0 {
+		g.Log().Infof(ctx,
+			"audio  frames=%d  in=%d B  out=%d B  pcm=%d samples",
+			n, len(frame.Payload), len(reEncoded), len(pcm),
+		)
+	}
+
+	// Auto-flush threshold. The StackChan UI doesn't send `listen:stop`
+	// (the second screen-tap calls protocol_->CloseAudioChannel which
+	// yanks the WS), so we can't wait for it. After ~3 s of audio,
+	// pause listening and play it back. The device transitions to
+	// kDeviceStateSpeaking on tts:start; subsequent frames during
+	// playback are ignored because IsListening() is now false.
+	if n >= echoFlushFrames {
+		sess.StopListening()
+		if err := playbackEcho(ctx, conn, sess); err != nil {
+			g.Log().Errorf(ctx, "auto-flush playback: %v", err)
+		}
+	}
+}
+
+// echoFlushFrames triggers loopback playback after this many buffered
+// opus frames. At 60 ms/frame this is ~3 s of audio.
+const echoFlushFrames = 50
+
+// playbackEcho sends the buffered re-encoded opus back to the device,
+// bracketed with `tts state:start` / `tts state:stop` so the device
+// transitions to speaking mode and plays the audio.
+//
+// xiaozhi-esp32's application.cc puts the device in kDeviceStateSpeaking
+// on tts:start and queues incoming opus to the audio service for
+// playback.
+func playbackEcho(ctx context.Context, conn *websocket.Conn, sess *Session) error {
+	frames := sess.DrainEcho()
+	if len(frames) == 0 {
+		g.Log().Debugf(ctx, "playback skipped: no audio buffered")
+		return nil
+	}
+	g.Log().Infof(ctx, "playback start  device_id=%s  frames=%d", sess.DeviceID, len(frames))
+
+	if err := conn.WriteJSON(map[string]string{"type": "tts", "state": "start"}); err != nil {
+		return err
+	}
+	if err := conn.WriteJSON(map[string]string{
+		"type": "tts", "state": "sentence_start", "text": "(echo)",
+	}); err != nil {
+		return err
+	}
+
+	frameMS := uint32(60) // matches our codec's framing
+	var ts uint32
+	for _, f := range frames {
+		bp2 := EncodeBP2(sess.BP2Version, BP2TypeOpus, ts, f)
+		if err := conn.WriteMessage(websocket.BinaryMessage, bp2); err != nil {
+			return err
+		}
+		ts += frameMS
+	}
+
+	if err := conn.WriteJSON(map[string]string{"type": "tts", "state": "stop"}); err != nil {
+		return err
+	}
+	g.Log().Infof(ctx, "playback done   device_id=%s  duration=%dms", sess.DeviceID, ts)
+	return nil
 }

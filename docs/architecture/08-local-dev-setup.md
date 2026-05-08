@@ -11,7 +11,7 @@
 | --- | --- | --- |
 | Go | 1.24+ | Existing server (`server/go.mod`) |
 | MySQL | 8.0+ | Agent / device DB the server already uses |
-| libopus | latest | CGo-bound from `github.com/hraban/opus` for STT decode + TTS encode. macOS: `brew install opus`. Debian: `apt install libopus-dev` |
+| libopus + opusfile | latest | CGo-bound via `github.com/hraban/opus` (used from M3 onwards for opus encode/decode). macOS: `brew install opus opusfile pkg-config`. Debian: `apt install libopus-dev libopusfile-dev pkg-config` |
 | Mistral API key | — | `MISTRAL_API_KEY` env var |
 | ESP-IDF | v5.5.4 | One-time firmware flash (matches `firmware/dependencies.lock`). Provides `idf.py`. Install: see [`firmware/README.md`](../../firmware/README.md) |
 | USB cable | — | Initial flash + serial logs |
