@@ -55,6 +55,20 @@ type Config struct {
 	// (~-1.4 dBFS) gives a comfortable level with minimal distortion
 	// risk. Set to 0 to disable normalization.
 	TTSPeakTarget int
+
+	// STTModel — Voxtral transcription model. Empty defaults to
+	// voxtral-mini-latest. Set MISTRAL_STT_MODEL to override.
+	STTModel string
+
+	// STTLanguage — ISO language hint for transcription (e.g. "en",
+	// "fr"). Empty lets the model auto-detect; setting it boosts
+	// accuracy for non-English speech.
+	STTLanguage string
+
+	// STTReplyTemplate — text spoken back after transcription, with
+	// %s replaced by the transcript. M5 demo path. Set to empty to
+	// just speak the transcript verbatim.
+	STTReplyTemplate string
 }
 
 var (
@@ -74,7 +88,10 @@ func Get() Config {
 			TTSVoice:      os.Getenv("MISTRAL_TTS_VOICE"),
 			TTSReplyText: envOr("GATEWAY_TTS_REPLY",
 				"Hello! This is your StackChan, replying through Mistral's Voxtral text to speech."),
-			TTSPeakTarget: envInt("GATEWAY_TTS_PEAK", 28000),
+			TTSPeakTarget:    envInt("GATEWAY_TTS_PEAK", 28000),
+			STTModel:         os.Getenv("MISTRAL_STT_MODEL"),
+			STTLanguage:      os.Getenv("MISTRAL_STT_LANGUAGE"),
+			STTReplyTemplate: envOr("GATEWAY_STT_REPLY", "You said: %s"),
 		}
 	})
 	return cfg

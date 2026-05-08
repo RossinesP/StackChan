@@ -5,6 +5,49 @@ SPDX-License-Identifier: MIT
 
 package mistral_gateway
 
+import (
+	"bytes"
+	"encoding/binary"
+)
+
+// EncodeWAVMono16 builds a minimal RIFF/WAVE container around mono
+// 16-bit PCM samples. Used to ship captured audio to Voxtral STT,
+// which accepts WAV uploads.
+//
+// Spec: http://soundfile.sapp.org/doc/WaveFormat/
+func EncodeWAVMono16(samples []int16, sampleRate int) []byte {
+	const (
+		channels      uint16 = 1
+		bitsPerSample uint16 = 16
+		audioFormat   uint16 = 1 // PCM
+	)
+	dataBytes := uint32(len(samples) * 2)
+	byteRate := uint32(sampleRate) * uint32(channels) * uint32(bitsPerSample/8)
+	blockAlign := channels * (bitsPerSample / 8)
+
+	var buf bytes.Buffer
+	buf.Grow(44 + int(dataBytes))
+
+	buf.WriteString("RIFF")
+	binary.Write(&buf, binary.LittleEndian, uint32(36+dataBytes))
+	buf.WriteString("WAVE")
+
+	buf.WriteString("fmt ")
+	binary.Write(&buf, binary.LittleEndian, uint32(16))
+	binary.Write(&buf, binary.LittleEndian, audioFormat)
+	binary.Write(&buf, binary.LittleEndian, channels)
+	binary.Write(&buf, binary.LittleEndian, uint32(sampleRate))
+	binary.Write(&buf, binary.LittleEndian, byteRate)
+	binary.Write(&buf, binary.LittleEndian, blockAlign)
+	binary.Write(&buf, binary.LittleEndian, bitsPerSample)
+
+	buf.WriteString("data")
+	binary.Write(&buf, binary.LittleEndian, dataBytes)
+	binary.Write(&buf, binary.LittleEndian, samples)
+
+	return buf.Bytes()
+}
+
 // Resample16 converts mono int16 PCM from srcRate to dstRate using
 // linear interpolation. Good enough for voice; for music-grade audio
 // you'd want a polyphase filter, but Voxtral's output is voice anyway.

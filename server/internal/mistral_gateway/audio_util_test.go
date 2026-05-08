@@ -105,6 +105,31 @@ func TestDecodeWAV(t *testing.T) {
 	}
 }
 
+func TestEncodeDecodeWAVRoundTrip(t *testing.T) {
+	samples := make([]int16, 200)
+	for i := range samples {
+		samples[i] = int16((i*173)%30000 - 15000) // pseudo-random shape
+	}
+	wav := EncodeWAVMono16(samples, 16000)
+
+	pcm, rate, err := decodeWAV(wav)
+	if err != nil {
+		t.Fatalf("decodeWAV: %v", err)
+	}
+	if rate != 16000 {
+		t.Errorf("rate = %d, want 16000", rate)
+	}
+	if len(pcm) != len(samples) {
+		t.Fatalf("len(pcm) = %d, want %d", len(pcm), len(samples))
+	}
+	for i := range samples {
+		if pcm[i] != samples[i] {
+			t.Errorf("[%d] %d != %d", i, pcm[i], samples[i])
+			break
+		}
+	}
+}
+
 func TestPeakNormalizeBoosts(t *testing.T) {
 	in := []int16{1000, -1500, 800, -2000} // peak = 2000
 	out := PeakNormalize(in, 28000)

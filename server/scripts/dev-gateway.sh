@@ -215,7 +215,15 @@ export GATEWAY_OPUS_VERSION="${GATEWAY_OPUS_VERSION:-2}"
 #   MISTRAL_TTS_VOICE    (default: auto-discover first voice from API;
 #                          list with: curl -H "Authorization: Bearer \$MISTRAL_API_KEY" \
 #                                      https://api.mistral.ai/v1/audio/voices | jq)
-#   GATEWAY_TTS_REPLY    (default: hello string baked into config.go)
+#   GATEWAY_TTS_REPLY    (default: static hello — only used if STT path
+#                          is disabled or fails)
+#   GATEWAY_TTS_PEAK     (default: 28000 ≈ -1.4 dBFS; 0 disables boost)
+#
+# M5 (transcribe-and-reply, default behaviour when API key is set):
+#   MISTRAL_STT_MODEL    (default: voxtral-mini-latest)
+#   MISTRAL_STT_LANGUAGE (default: empty = auto-detect; e.g. "en", "fr")
+#   GATEWAY_STT_REPLY    (default: "You said: %s"; set to empty to fall
+#                          back to M4 static greeting)
 
 # Point GoFrame at the dev config so utility/rsa.go finds RSA keys.
 export GF_GCFG_FILE="$DEV_CONFIG"

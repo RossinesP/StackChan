@@ -234,6 +234,10 @@ func handleAudio(ctx context.Context, conn *websocket.Conn, sess *Session, paylo
 		g.Log().Warningf(ctx, "opus decode failed: %v (bytes=%d)", err, len(frame.Payload))
 		return
 	}
+	// Buffer raw PCM for STT (M5) BEFORE re-encoding — the re-encoded
+	// opus is lossy and STT works better on the original samples.
+	sess.BufferPCM(pcm)
+
 	reEncoded, err := sess.Codec.Encode(pcm)
 	if err != nil {
 		g.Log().Warningf(ctx, "opus re-encode failed: %v (samples=%d)", err, len(pcm))
@@ -269,14 +273,62 @@ func handleAudio(ctx context.Context, conn *websocket.Conn, sess *Session, paylo
 // opus frames. At 60 ms/frame this is ~3 s of audio.
 const echoFlushFrames = 50
 
-// playbackReply dispatches between TTS (M4) and echo (M3) based on
-// whether MISTRAL_API_KEY is set. Echo remains as a no-network fallback
-// for offline development.
+// playbackReply dispatches between M3/M4/M5 based on what's configured:
+//   - No API key       → M3 echo (offline-friendly fallback)
+//   - API key only     → M5 transcribe-and-reply (the user-facing
+//                        "interactive demo" — speaks back what was said)
+// To pin the static M4 greeting instead of M5, set GATEWAY_STT_REPLY="".
 func playbackReply(ctx context.Context, conn *websocket.Conn, sess *Session) error {
-	if Get().MistralAPIKey != "" {
+	c := Get()
+	if c.MistralAPIKey == "" {
+		return playbackEcho(ctx, conn, sess)
+	}
+	if c.STTReplyTemplate == "" {
+		// Static TTS path (M4) — no transcription, no echo of the user.
+		return playbackTTS(ctx, conn, sess, c.TTSReplyText)
+	}
+	return playbackTranscribeAndReply(ctx, conn, sess)
+}
+
+// playbackTranscribeAndReply (M5):
+//  1. Drain the buffered PCM
+//  2. Send to Voxtral STT
+//  3. Format the transcript via STTReplyTemplate
+//  4. Synthesize via Voxtral TTS
+//  5. Stream back through the existing playback path
+//
+// Falls back to playbackTTS(static greeting) on STT failure so the
+// device always gets some response.
+func playbackTranscribeAndReply(ctx context.Context, conn *websocket.Conn, sess *Session) error {
+	pcm := sess.DrainPCM()
+	if len(pcm) == 0 {
+		g.Log().Warningf(ctx, "stt skipped: no PCM buffered")
 		return playbackTTS(ctx, conn, sess, Get().TTSReplyText)
 	}
-	return playbackEcho(ctx, conn, sess)
+
+	t0 := time.Now()
+	g.Log().Infof(ctx,
+		"stt request  device_id=%s  samples=%d  duration_ms=%d",
+		sess.DeviceID, len(pcm), len(pcm)*1000/sess.Codec.sampleRate,
+	)
+
+	transcript, err := TranscribeAudio(ctx, pcm, sess.Codec.sampleRate, Get().STTLanguage)
+	if err != nil {
+		g.Log().Errorf(ctx, "stt failed, falling back to static TTS: %v", err)
+		return playbackTTS(ctx, conn, sess, Get().TTSReplyText)
+	}
+	g.Log().Infof(ctx,
+		"stt response device_id=%s  api_ms=%d  transcript=%q",
+		sess.DeviceID, time.Since(t0).Milliseconds(), transcript,
+	)
+
+	if transcript == "" {
+		// Voxtral returned empty (silence or unintelligible) — say so.
+		return playbackTTS(ctx, conn, sess, "I didn't catch that.")
+	}
+
+	reply := fmt.Sprintf(Get().STTReplyTemplate, transcript)
+	return playbackTTS(ctx, conn, sess, reply)
 }
 
 // playbackEcho sends the buffered re-encoded opus back to the device,
