@@ -273,37 +273,50 @@ func handleAudio(ctx context.Context, conn *websocket.Conn, sess *Session, paylo
 // opus frames. At 60 ms/frame this is ~3 s of audio.
 const echoFlushFrames = 50
 
-// playbackReply dispatches between M3/M4/M5 based on what's configured:
-//   - No API key       → M3 echo (offline-friendly fallback)
-//   - API key only     → M5 transcribe-and-reply (the user-facing
-//                        "interactive demo" — speaks back what was said)
-// To pin the static M4 greeting instead of M5, set GATEWAY_STT_REPLY="".
+// playbackReply dispatches between M3/M4/M5/M7 based on what's
+// configured. Order matters — first match wins:
+//
+//	no API key                       → M3 echo (offline-friendly)
+//	ChatEnabled  (default true)      → M7 STT → LLM → TTS
+//	STTReplyTemplate set             → M5 STT → "You said: %s" → TTS
+//	(neither chat nor template)      → M4 static greeting via TTS
+//
+// To force the M5 echo template instead of chat:
+//	GATEWAY_CHAT_ENABLED=false
+// To force the M4 static greeting:
+//	GATEWAY_CHAT_ENABLED=false  GATEWAY_STT_REPLY=""
 func playbackReply(ctx context.Context, conn *websocket.Conn, sess *Session) error {
 	c := Get()
 	if c.MistralAPIKey == "" {
 		return playbackEcho(ctx, conn, sess)
 	}
-	if c.STTReplyTemplate == "" {
-		// Static TTS path (M4) — no transcription, no echo of the user.
-		return playbackTTS(ctx, conn, sess, c.TTSReplyText)
+	if c.ChatEnabled {
+		return playbackTranscribeAndReply(ctx, conn, sess)
 	}
-	return playbackTranscribeAndReply(ctx, conn, sess)
+	if c.STTReplyTemplate != "" {
+		return playbackTranscribeAndReply(ctx, conn, sess)
+	}
+	return playbackTTS(ctx, conn, sess, c.TTSReplyText)
 }
 
-// playbackTranscribeAndReply (M5):
+// playbackTranscribeAndReply (M5 + M7):
 //  1. Drain the buffered PCM
 //  2. Send to Voxtral STT
-//  3. Format the transcript via STTReplyTemplate
-//  4. Synthesize via Voxtral TTS
+//  3. Generate the reply text:
+//       - if ChatEnabled  → Mistral chat completions with session history
+//       - else            → format transcript via STTReplyTemplate
+//  4. Synthesize via Voxtral TTS (streaming when possible)
 //  5. Stream back through the existing playback path
 //
-// Falls back to playbackTTS(static greeting) on STT failure so the
+// Each external call has a fallback: STT failure → static greeting,
+// chat failure → STT template, TTS failure → re-encoded echo. The
 // device always gets some response.
 func playbackTranscribeAndReply(ctx context.Context, conn *websocket.Conn, sess *Session) error {
+	c := Get()
 	pcm := sess.DrainPCM()
 	if len(pcm) == 0 {
 		g.Log().Warningf(ctx, "stt skipped: no PCM buffered")
-		return playbackTTS(ctx, conn, sess, Get().TTSReplyText)
+		return playbackTTS(ctx, conn, sess, c.TTSReplyText)
 	}
 
 	t0 := time.Now()
@@ -312,10 +325,10 @@ func playbackTranscribeAndReply(ctx context.Context, conn *websocket.Conn, sess 
 		sess.DeviceID, len(pcm), len(pcm)*1000/sess.Codec.sampleRate,
 	)
 
-	transcript, err := TranscribeAudio(ctx, pcm, sess.Codec.sampleRate, Get().STTLanguage)
+	transcript, err := TranscribeAudio(ctx, pcm, sess.Codec.sampleRate, c.STTLanguage)
 	if err != nil {
 		g.Log().Errorf(ctx, "stt failed, falling back to static TTS: %v", err)
-		return playbackTTS(ctx, conn, sess, Get().TTSReplyText)
+		return playbackTTS(ctx, conn, sess, c.TTSReplyText)
 	}
 	g.Log().Infof(ctx,
 		"stt response device_id=%s  api_ms=%d  transcript=%q",
@@ -327,8 +340,41 @@ func playbackTranscribeAndReply(ctx context.Context, conn *websocket.Conn, sess 
 		return playbackTTS(ctx, conn, sess, "I didn't catch that.")
 	}
 
-	reply := fmt.Sprintf(Get().STTReplyTemplate, transcript)
+	reply := generateReplyText(ctx, sess, transcript)
 	return playbackTTS(ctx, conn, sess, reply)
+}
+
+// generateReplyText produces the assistant reply text from the user's
+// transcript. Routes through Mistral chat when enabled, falling back
+// to the M5 template (or a generic "got it" if the template is empty
+// too) on chat failure.
+func generateReplyText(ctx context.Context, sess *Session, transcript string) string {
+	c := Get()
+	if c.ChatEnabled {
+		t0 := time.Now()
+		hist := truncateHistory(sess.History, c.ChatHistoryLimit)
+		g.Log().Infof(ctx,
+			"chat request  device_id=%s  model=%s  history_msgs=%d  user=%q",
+			sess.DeviceID, c.MistralChatModel, len(hist), transcript,
+		)
+		reply, err := GenerateReply(ctx, transcript, hist)
+		if err == nil && reply != "" {
+			g.Log().Infof(ctx,
+				"chat response device_id=%s  api_ms=%d  reply=%q",
+				sess.DeviceID, time.Since(t0).Milliseconds(), reply,
+			)
+			sess.AppendTurn(transcript, reply)
+			return reply
+		}
+		g.Log().Errorf(ctx,
+			"chat failed (api_ms=%d), falling back to template: %v",
+			time.Since(t0).Milliseconds(), err,
+		)
+	}
+	if c.STTReplyTemplate != "" {
+		return fmt.Sprintf(c.STTReplyTemplate, transcript)
+	}
+	return "Got it."
 }
 
 // playbackEcho sends the buffered re-encoded opus back to the device,

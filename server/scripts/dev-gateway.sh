@@ -232,6 +232,16 @@ export GATEWAY_OPUS_VERSION="${GATEWAY_OPUS_VERSION:-2}"
 #   MISTRAL_TTS_PCM_RATE (default: 24000; sample rate Voxtral emits
 #                          in pcm/stream mode — change only if Mistral
 #                          documents a different default)
+#
+# M7 (Mistral chat completions, default ON when API key is set):
+#   GATEWAY_CHAT_ENABLED      (default: true; set to "false" to fall
+#                               back to the M5 STT template path)
+#   MISTRAL_CHAT_MODEL        (default: mistral-small-latest)
+#   GATEWAY_CHAT_SYSTEM       (default: short StackChan persona,
+#                               see config.go for the full string)
+#   GATEWAY_CHAT_MAX_TOKENS   (default: 200 ≈ 15-25 spoken seconds)
+#   GATEWAY_CHAT_HISTORY      (default: 6 messages = last 3 exchanges;
+#                               set to 0 to disable per-session memory)
 
 # Point GoFrame at the dev config so utility/rsa.go finds RSA keys.
 export GF_GCFG_FILE="$DEV_CONFIG"
@@ -243,7 +253,13 @@ echo "  GATEWAY_OPUS_VERSION = $GATEWAY_OPUS_VERSION"
 echo "  GF_GCFG_FILE         = $GF_GCFG_FILE"
 if [[ -n "${MISTRAL_API_KEY:-}" ]]; then
   stream_mode="${GATEWAY_TTS_STREAM:-true}"
-  echo "  MISTRAL_API_KEY      = sk-***${MISTRAL_API_KEY: -4} (TTS enabled, stream=$stream_mode)"
+  chat_mode="${GATEWAY_CHAT_ENABLED:-true}"
+  if [[ "$chat_mode" == "true" ]]; then
+    chat_label="chat=on (${MISTRAL_CHAT_MODEL:-mistral-small-latest})"
+  else
+    chat_label="chat=off (template path)"
+  fi
+  echo "  MISTRAL_API_KEY      = sk-***${MISTRAL_API_KEY: -4} (TTS stream=$stream_mode, $chat_label)"
 else
   echo "  MISTRAL_API_KEY      = (unset → M3 echo loopback)"
 fi

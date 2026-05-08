@@ -81,6 +81,33 @@ type Config struct {
 	// observed at 24 kHz; expose as an env var in case Mistral changes
 	// the default. Only used when TTSStream is true.
 	MistralPCMSampleRate int
+
+	// ChatEnabled gates the M7 LLM reply path. When true (the default
+	// once an API key is present), transcripts are passed through
+	// Mistral chat completions before TTS instead of the template.
+	// Disable to fall back to STTReplyTemplate / static greeting.
+	ChatEnabled bool
+
+	// MistralChatModel — chat completions model name. Defaults to
+	// mistral-small-latest, which is fast (~600 ms first token for
+	// short prompts) and capable enough for casual conversation.
+	MistralChatModel string
+
+	// ChatSystemPrompt frames the assistant's persona. Kept short and
+	// audio-aware by default so replies don't exceed comfortable
+	// listening length and don't contain markdown/code blocks the TTS
+	// would mangle.
+	ChatSystemPrompt string
+
+	// ChatMaxTokens caps the assistant reply length. ~200 tokens ≈
+	// 15-25 spoken seconds, which is the upper limit of "still feels
+	// like a conversation, not a monologue".
+	ChatMaxTokens int
+
+	// ChatHistoryLimit caps how many user/assistant turns we replay on
+	// each request. 6 = last 3 exchanges. Keeps prompt cost bounded
+	// without losing immediate context.
+	ChatHistoryLimit int
 }
 
 var (
@@ -106,6 +133,15 @@ func Get() Config {
 			STTReplyTemplate:     envOr("GATEWAY_STT_REPLY", "You said: %s"),
 			TTSStream:            envBool("GATEWAY_TTS_STREAM", true),
 			MistralPCMSampleRate: envInt("MISTRAL_TTS_PCM_RATE", 24000),
+			ChatEnabled:          envBool("GATEWAY_CHAT_ENABLED", true),
+			MistralChatModel:     envOr("MISTRAL_CHAT_MODEL", "mistral-small-latest"),
+			ChatSystemPrompt: envOr("GATEWAY_CHAT_SYSTEM",
+				"You are StackChan, a small friendly desktop robot. "+
+					"Reply briefly (1-2 short sentences) and warmly. "+
+					"Your output is spoken aloud, so use plain prose — no "+
+					"markdown, no lists, no code blocks, no emoji."),
+			ChatMaxTokens:    envInt("GATEWAY_CHAT_MAX_TOKENS", 200),
+			ChatHistoryLimit: envInt("GATEWAY_CHAT_HISTORY", 6),
 		}
 	})
 	return cfg

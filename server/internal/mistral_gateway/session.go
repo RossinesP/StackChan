@@ -32,6 +32,21 @@ type Session struct {
 	// Voxtral STT in M5. Kept alongside echoBuf because re-encoding to
 	// opus is lossy — STT works better on the original PCM.
 	pcmFrames [][]int16
+
+	// History is the per-session conversation log used by the M7 chat
+	// reply path. Truncated on each turn via truncateHistory.
+	History []ChatMessage
+}
+
+// AppendTurn records one user/assistant exchange in the session
+// history, then truncates to the configured limit. Called after a
+// successful chat completion so the next turn has context.
+func (s *Session) AppendTurn(userText, assistantText string) {
+	s.History = append(s.History,
+		ChatMessage{Role: RoleUser, Content: userText},
+		ChatMessage{Role: RoleAssistant, Content: assistantText},
+	)
+	s.History = truncateHistory(s.History, Get().ChatHistoryLimit)
 }
 
 func (s *Session) StartListening() {
