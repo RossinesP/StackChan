@@ -1,5 +1,10 @@
 # 08 — Local Dev Setup for the Mistral Gateway
 
+> **STATUS — Up-to-date with shipped Path A (PR #1).** The
+> `scripts/dev-gateway.sh` referenced below was added during M1+M2
+> and has been kept current with every milestone since (env vars
+> printed in the startup banner now reflect M3 through M10).
+
 > The practical "how do I run this on my laptop with one StackChan on
 > the desk" layer for [Path A](./06-mistral-migration.md). Wire-protocol
 > details and milestones live in [07-path-a-implementation.md](./07-path-a-implementation.md);
@@ -152,17 +157,56 @@ expected log lines, and common firewall/IP gotchas — then `exec`s
 `go run main.go`. Override with `IP=<addr>` or `PORT=<n>` env vars if
 auto-detection picks the wrong interface.
 
-Manual equivalent:
+Manual equivalent (minimal):
 
 ```bash
 cd server
 export MISTRAL_API_KEY=sk-...
 export GATEWAY_WS_URL=ws://192.168.1.42:12800/xiaozhi/v1/   # what OTA returns
-export GATEWAY_OPUS_VERSION=2                                # BinaryProtocol version
 go run main.go
 ```
 
-Expected log lines on first device boot:
+The script reads `~/.stackchan-dev/server-config.yaml` for RSA keys
+and JWT secret (auto-generated on first run, GoFrame's `utility/rsa.go`
+panics on empty keys).
+
+### All env vars (M1 → M10 cheat sheet)
+
+The script's startup banner already prints these in groups; this is
+the flat reference. Defaults all "just work" — set only what you need
+to override.
+
+| Variable | Default | What |
+| --- | --- | --- |
+| `GATEWAY_WS_URL` | `ws://localhost:12800/xiaozhi/v1/` | Returned in OTA response; must be reachable from the device |
+| `GATEWAY_OPUS_VERSION` | `2` | BinaryProtocol2 version advertised in OTA |
+| `MISTRAL_API_KEY` | (empty) | Required from M4 onwards. Without it, gateway falls back to M3 echo loopback (offline-friendly fallback) |
+| `MISTRAL_TTS_MODEL` | `voxtral-mini-tts-2603` | TTS model |
+| `MISTRAL_TTS_VOICE` | (auto) | Voice ID; auto-discovers a preset voice if unset |
+| `GATEWAY_TTS_REPLY` | "Hello! …" | Static greeting (used only if STT path is disabled) |
+| `GATEWAY_TTS_PEAK` | `28000` | Peak normalize target (signed int16 magnitude). 0 disables boost |
+| `GATEWAY_TTS_STREAM` | `true` | M6: SSE streaming TTS (vs buffered WAV) |
+| `MISTRAL_TTS_PCM_RATE` | `24000` | Sample rate Voxtral emits in `pcm` streaming mode |
+| `MISTRAL_STT_MODEL` | `voxtral-mini-latest` | STT model |
+| `MISTRAL_STT_LANGUAGE` | (auto) | ISO language hint (e.g. `en`, `fr`); empty lets the model auto-detect |
+| `GATEWAY_STT_REPLY` | `"You said: %s"` | M5 echo template; used as fallback when chat is off or fails. Set to "" to fall back to static greeting |
+| `GATEWAY_CHAT_ENABLED` | `true` | M7: route transcripts through Mistral chat completions |
+| `MISTRAL_CHAT_MODEL` | `mistral-small-latest` | Chat model |
+| `GATEWAY_CHAT_SYSTEM` | (StackChan persona) | System prompt — see config.go for the full default |
+| `GATEWAY_CHAT_MAX_TOKENS` | `200` | Max reply tokens (~15-25 spoken seconds) |
+| `GATEWAY_CHAT_HISTORY` | `6` | Last N messages (= last 3 exchanges) replayed each turn. 0 disables memory |
+| `GATEWAY_CHAT_TOOLS` | `true` | M8b: forward MCP tools to chat completions |
+| `GATEWAY_CHAT_TOOL_MAX_ITER` | `3` | Cap on chat→tool→chat round-trips per user turn |
+| `GATEWAY_CHAT_TOOL_BLOCK` | (auto) | Comma-separated tool names hidden from Mistral. Auto-blocks `take_photo` when vision is off; "-" disables blocking entirely |
+| `GATEWAY_VISION_ENABLED` | `true` | M9: enable photo upload + Pixtral analysis endpoint |
+| `MISTRAL_VISION_MODEL` | `mistral-medium-latest` | Vision model |
+| `GATEWAY_VISION_URL` | (auto) | Auto-derived from `GATEWAY_WS_URL`; override only behind a reverse proxy |
+| `GATEWAY_PHOTO_DIR` | `./photos` | Where saved JPEGs land. Empty disables saving |
+| `GATEWAY_VISION_MAX_BYTES` | `1048576` | Max upload size (1 MB) |
+| `GATEWAY_VISION_PROMPT` | (audio-friendly wrapper) | `%s` is replaced with the user's question |
+| `GATEWAY_EMOTION_ENABLED` | `true` | M10: parse `[emotion:NAME]` tags from LLM reply, send to device avatar |
+
+Expected log lines on first device boot (M1–M2):
 
 ```
 INFO  /xiaozhi/ota/  device_id=AA:BB:CC:DD:EE:FF client_id=...
@@ -170,13 +214,16 @@ INFO  ota response  ws_url=ws://192.168.1.42:12800/xiaozhi/v1/  token=eyJ...
 INFO  /xiaozhi/v1/  upgrade  device_id=AA:BB:CC:DD:EE:FF
 INFO  hello  format=opus rate=16000 frame=60ms features={aec:true mcp:true}
 INFO  hello-ack sent  session_id=...
+INFO  mcp initialize ok  vision_url=http://192.168.1.42:12800/xiaozhi/vision/explain
+INFO  mcp tools/list ok  count=11  exposed=11  tools=[self.robot.set_head_angles ...]
 ```
 
-Routes are bound in `server/internal/cmd/cmd.go`:
+Routes bound in `server/internal/cmd/cmd.go`:
 
 ```go
 s.BindHandler("POST:/xiaozhi/ota/", mistral_gateway.OtaHandler)
 s.BindHandler("/xiaozhi/v1/", mistral_gateway.WsHandler)
+s.BindHandler("POST:/xiaozhi/vision/explain", mistral_gateway.VisionExplainHandler)
 ```
 
 (See [07-path-a-implementation.md](./07-path-a-implementation.md#gateway-component-breakdown)

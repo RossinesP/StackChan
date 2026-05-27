@@ -1,5 +1,15 @@
 # 06 — Mistral Migration: Two Paths
 
+> **STATUS — Path A shipped.** As of PR #1 (`feat/mistral-gateway`,
+> merged into `main`), the entire Path A gateway is live and verified
+> on real hardware: voice → STT → LLM with per-session memory + MCP
+> function calls + camera/vision → expressive avatar + spoken reply.
+> See `server/internal/mistral_gateway/` for the implementation and
+> [`07-path-a-implementation.md`](./07-path-a-implementation.md) for
+> the post-mortem milestone log. Path B remains the documented
+> alternative if the gateway translation cost ever stops feeling
+> worth it.
+
 This doc compares **two realistic strategies** for replacing xiaozhi.me's
 LLM + STT + TTS with Mistral's APIs. Both end at the same outcome (a
 working voice assistant on the StackChan robot), but they differ
@@ -20,7 +30,7 @@ ecosystem you keep.
 | **App changes** | Minimal (rebase `XiaoZhi_util.dart` URLs if you also re-host config) | Same as A |
 | **Keeps xiaozhi-esp32 vendored** | Yes (intact) | No (or only the audio I/O parts) |
 | **OTA, wake-word, audio I/O** | Untouched | You own them |
-| **Effort estimate** | Medium (1 dev × few weeks for the gateway) | High (1 dev × months; embedded C++ + protocol design) |
+| **Effort estimate** | Medium (1 dev × few weeks; **actual: ~10 milestone commits, AI-paired, all in one focused sprint**) | High (1 dev × months; embedded C++ + protocol design) |
 | **Risk** | Low — firmware is unchanged. Worst case: revert `OTA_URL`. | High — bricked devices, audio glitches, MCP bugs |
 | **Maintainability** | Bound to xiaozhi protocol changes (vendor at v2.2.4) | You own the stack; no upstream churn |
 | **Reuses Mistral standard APIs** | Yes (server uses `chat/completions`, audio APIs) | Yes (firmware does, more directly) |
@@ -94,13 +104,24 @@ flowchart LR
 
 ### Concrete files to add / touch
 
-| Where | Change |
-| --- | --- |
-| `firmware/main/Kconfig.projbuild:5` | `default "https://api.tenclass.net/xiaozhi/ota/"` → your gateway |
-| `server/internal/web_socket/web_socket.go` | Add a third `deviceType=AI` branch (or new handler) implementing the xiaozhi WS protocol |
-| `server/internal/xiaozhi/xiaozhi.go:37` | Optional: stub `baseUrl` so REST control plane targets your DB instead of xiaozhi.me |
-| `server/go.mod` | Add `github.com/hraban/opus`, Mistral HTTP client, MCP JSON-RPC helper |
-| New: `server/internal/mistral_gateway/{ws.go, ota.go, stt.go, tts.go, llm.go, mcp.go}` | The actual gateway logic |
+The list below shows what we actually shipped (file names sometimes
+diverge from the original plan — `chat.go` not `llm.go`, plus several
+files we hadn't anticipated).
+
+| Where | Change | Status |
+| --- | --- | --- |
+| `firmware/main/Kconfig.projbuild:5` | `default "https://api.tenclass.net/xiaozhi/ota/"` → your gateway (LAN IP at dev time) | done |
+| `server/internal/cmd/cmd.go` | Bind `POST /xiaozhi/ota/`, `WS /xiaozhi/v1/`, `POST /xiaozhi/vision/explain` | done |
+| `server/go.mod` | Adds `github.com/hraban/opus` (CGo + libopus), `github.com/gorilla/websocket`. No Mistral SDK — `net/http` directly | done |
+| New: `server/internal/mistral_gateway/config.go` | Env-driven config (one place for every knob) | done |
+| New: `server/internal/mistral_gateway/{ota.go, ws.go, session.go, framing.go, opus.go, audio_util.go}` | Wire layer | done |
+| New: `server/internal/mistral_gateway/{stt.go, tts.go}` | Voxtral STT + buffered/streaming TTS | done |
+| New: `server/internal/mistral_gateway/{chat.go, mcp.go, tools_map.go}` | Chat completions + JSON-RPC over WS + tool-call loop | done |
+| New: `server/internal/mistral_gateway/{vision.go, vision_client.go}` | `/explain` HTTP endpoint + multimodal Pixtral call | done |
+| New: `server/internal/mistral_gateway/emotion.go` | Inline `[emotion:NAME]` parser → device avatar event | done |
+| New: `server/scripts/dev-gateway.sh` | LAN-IP autodetect, RSA key gen, env summary banner | done |
+| `server/internal/web_socket/web_socket.go` | (Originally proposed extension — NOT touched. The gateway is a separate route group, decoupled from the existing companion plane) | skipped |
+| `server/internal/xiaozhi/xiaozhi.go` | Untouched — the gateway has no dependency on the legacy xiaozhi REST plane | skipped |
 
 ## Path B — Full firmware replacement
 
@@ -206,15 +227,18 @@ Pick **Path B** if any of these hold:
 
 ## Cross-cutting concerns regardless of path
 
-| Concern | Notes |
+| Concern | Notes (post-shipment for Path A) |
 | --- | --- |
-| **MCP tools** | Today: `self.robot.get_head_angles`, `self.robot.set_head_angles` (`hal_mcp.cpp`). Map to Mistral function calling — same JSON Schema shape. Add more tools (`set_emotion`, `play_dance`, `get_battery`) by extending `hal_mcp.cpp` patterns. |
-| **Wake-word** | Stays on-device (`esp-sr` AFE model). If you switch to always-on streaming with server-side VAD, you can disable the wake-word component to save flash + RAM. |
-| **Opus** | Firmware uses `espressif/esp_audio_codec`. If your gateway needs opus, use `github.com/hraban/opus` (CGo + libopus). Mistral audio APIs likely accept WAV/MP3/Opus — confirm formats. |
-| **Agent config** | Today persisted in xiaozhi.me; mirrored in Go server's `service/agent.go`. For either path, persist locally and have your Mistral plane read it per session. |
-| **License / activation** | `internal/controller/xiaozhi/xiaozhi_v1_get_xiao_zhi_generate_license_token.go` — this is xiaozhi-specific. Replace with your own provisioning, or stub. |
-| **Companion plane** | `/stackChan/ws` between firmware and Go server (Opus/JPEG/control for the App) is unaffected. Keep it. |
-| **OTA firmware updates** | xiaozhi's `ota.cc` handles firmware OTA in addition to server discovery. If you keep xiaozhi vendored (Path A), OTA still works. If you fully replace (Path B), reimplement OTA via `firmware/main/hal/hal_ota.cpp`. |
+| **MCP tools** | StackChan exposes 11 tools today (head angles, LED, reminders, camera, plus several from upstream xiaozhi-esp32). Mapping to Mistral function-calling is direct — `tools_map.go` keeps `inputSchema` as raw JSON so it round-trips verbatim. The chat-tool loop runs in a goroutine so the WS reader stays free to deliver MCP responses. |
+| **Wake-word** | Stayed on-device. The "Hi StackChan" model (`wn9_histackchan_tts3`) lives in `sdkconfig.defaults`. Wake-word triggers `listen:detect` which we treat identically to `listen:start`. |
+| **Opus** | `github.com/hraban/opus` works (`brew install opus opusfile pkg-config` on macOS). One footgun documented in `opus.go`: `Decode/Encode` alias an internal buffer — callers MUST copy. |
+| **Agent config** | Currently env-driven (one global system prompt per gateway process). Per-MAC DB-backed config is the M11 wishlist item. |
+| **License / activation** | OTA returns an empty `activation` block; the device skips the code-entry flow. The patched firmware (`firmware/patches/xiaozhi-esp32.patch`) already accepts this. |
+| **Companion plane** | `/stackChan/ws` between firmware and Go server (Opus/JPEG/control for the App) is unaffected — confirmed at runtime, no interaction with the gateway. |
+| **OTA firmware updates** | xiaozhi's `ota.cc` still handles firmware OTA. The gateway's `/xiaozhi/ota/` returns the WS URL only; firmware-OTA upgrade URLs would be a future extension. |
+| **TTS streaming reality** | Voxtral's "stream" mode is mostly buffered server-side: first audio chunk arrives at ~3 s TTFA carrying ~400 ms of audio, rest streams at near-real-time. So streaming doesn't move TTFA much vs buffered, but it's still worth keeping for resilience (the 5xx retry hides transient `unreachable_backend` errors). |
+| **Vision** | Device's `take_photo` MCP tool POSTs JPEG + question to a separate `POST /xiaozhi/vision/explain` HTTP endpoint we run. Per-session bearer token sent via MCP `initialize.capabilities.vision.{url, token}`. Empty question → save-only; non-empty → Pixtral analysis. |
+| **Emotion** | Inline `[emotion:NAME]` tags in the LLM reply, parsed gateway-side, sent to the device as `{type:"llm",emotion:NAME}` before TTS, stripped from the spoken text. Allowlist matches the firmware's `SetEmotion` switch. |
 
 ## Quick reference — all swap points in one table
 

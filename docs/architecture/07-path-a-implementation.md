@@ -1,5 +1,11 @@
 # 07 — Path A: Detailed Implementation Plan
 
+> **STATUS — Shipped (PR #1).** This doc was originally a build guide;
+> it now doubles as a post-mortem. Sections marked **(SHIPPED)** describe
+> what landed; sections marked **(PLANNED)** are forward-looking. The
+> milestone table near the end has both the original plan and what
+> actually happened side by side.
+
 > Build a **xiaozhi-protocol-speaking gateway** that translates to Mistral
 > APIs, then redirect the firmware to it via `OTA_URL`. Firmware code
 > stays untouched.
@@ -10,16 +16,20 @@ at `firmware/xiaozhi-esp32/` via `firmware/repos.json`).
 
 ## Mistral building blocks (as of 2026)
 
-| Need | Mistral product | Notes |
-| --- | --- | --- |
-| STT (real-time) | **Voxtral Realtime** | sub-200 ms latency, $0.006/min, streaming WebSocket |
-| STT (batch fallback) | **Voxtral Mini Transcribe V2** | speaker diarization, word-level timestamps |
-| LLM | **Mistral chat completions** (any chat model) | function-calling for MCP tools |
-| TTS | **Voxtral TTS** | 9 languages, zero-shot voice cloning from 3 s of audio |
+What we actually used in the shipped gateway, in the order each
+appears in a single user turn:
+
+| Need | Mistral product (used) | Endpoint | Notes |
+| --- | --- | --- | --- |
+| STT (batch) | **Voxtral Mini latest** | `POST /v1/audio/transcriptions` | We send WAV multipart after auto-flush (~3 s of buffered audio). Realtime/streaming STT was on the table but batch turned out to be plenty fast (~250-350 ms per 3 s clip) |
+| LLM | **`mistral-small-latest`** by default, configurable | `POST /v1/chat/completions` | Function-calling for MCP tools; per-session history (last 6 messages = 3 exchanges) |
+| TTS | **`voxtral-mini-tts-2603`** | `POST /v1/audio/speech` | Both buffered (WAV) and streaming (SSE / `pcm`) paths. See "TTS streaming reality" caveat in `06-mistral-migration.md` |
+| Vision | **`mistral-medium-latest`** by default, configurable | `POST /v1/chat/completions` (multimodal) | JPEG embedded inline as base64 data URL. Used by the `/xiaozhi/vision/explain` HTTP endpoint when the device's `take_photo` MCP tool fires with a non-empty question |
 
 API base: `https://api.mistral.ai/v1`. Docs:
 [Speech to Text](https://docs.mistral.ai/studio-api/audio/speech_to_text),
-[Voxtral overview](https://mistral.ai/news/voxtral).
+[Voxtral overview](https://mistral.ai/news/voxtral),
+[Vision](https://docs.mistral.ai/capabilities/vision).
 
 ## End-to-end gateway architecture
 
@@ -28,9 +38,9 @@ sequenceDiagram
     autonumber
     participant FW as Firmware<br/>(xiaozhi-esp32)
     participant GW as Mistral Gateway<br/>(your new Go service)
-    participant V as Voxtral Realtime<br/>(STT WebSocket)
-    participant L as Mistral Chat<br/>(LLM HTTPS)
-    participant T as Voxtral TTS<br/>(HTTPS)
+    participant V as Voxtral STT<br/>(POST /v1/audio/transcriptions)
+    participant L as Mistral Chat<br/>(POST /v1/chat/completions)
+    participant T as Voxtral TTS<br/>(POST /v1/audio/speech, SSE)
 
     Note over FW,GW: Boot
     FW->>GW: POST /xiaozhi/ota/<br/>headers: Device-Id, Client-Id, Activation-Version
@@ -41,20 +51,19 @@ sequenceDiagram
     FW->>GW: JSON {type:"hello", version, transport:"websocket",<br/>features:{aec, mcp:true},<br/>audio_params:{format:"opus", sample_rate:16000,<br/>channels:1, frame_duration:60}}
     GW-->>FW: JSON {type:"hello", transport:"websocket",<br/>session_id, audio_params:{sample_rate, frame_duration}}
 
-    GW->>V: WSS connect (Voxtral Realtime)
-    GW->>L: prepare chat session<br/>(load agent system prompt + tool defs)
-
-    GW->>FW: JSON {type:"mcp", payload:{jsonrpc:"2.0",<br/>method:"tools/list", id:1}}
-    FW-->>GW: JSON {type:"mcp", payload:{jsonrpc:"2.0",<br/>id:1, result:{tools:[...]}}}
+    GW->>FW: JSON {type:"mcp", payload:{jsonrpc:"2.0",<br/>method:"initialize", id:1, params:{capabilities:{vision:{url, token}}}}}
+    FW-->>GW: JSON {type:"mcp", payload:{jsonrpc:"2.0",<br/>id:1, result:{...}}}
+    GW->>FW: JSON {type:"mcp", payload:{jsonrpc:"2.0",<br/>method:"tools/list", id:2}}
+    FW-->>GW: JSON {type:"mcp", payload:{jsonrpc:"2.0",<br/>id:2, result:{tools:[...]}}}
 
     loop user speaks
         FW->>GW: BINARY opus frames (BinaryProtocol2 framed)
-        GW->>GW: opus → PCM 16kHz mono
-        GW->>V: PCM stream
-        V-->>GW: partial transcripts → final transcript
+        GW->>GW: opus → PCM 16kHz mono (buffer in-memory)
     end
+    Note over GW: auto-flush at 50 frames (~3 s)
+    GW->>V: POST /v1/audio/transcriptions (multipart WAV)
+    V-->>GW: {text: "<final transcript>"}
 
-    GW->>FW: JSON {type:"stt", text:"<final transcript>"}
     GW->>L: chat/completions(messages + tools)
     L-->>GW: stream {content:"...", tool_calls:[...]}
 
@@ -278,62 +287,90 @@ reply.
 ```
 server/internal/mistral_gateway/
 ├── ota.go              Implements POST /xiaozhi/ota/  (returns ws URL)
-├── ws.go               Upgrades to WS, runs the per-session loop
-├── framing.go          BinaryProtocol2 encode/decode + JSON frame split
-├── opus.go             libopus wrapper (encode 24kHz/16kHz, decode 16kHz)
-├── stt.go              Voxtral Realtime client
-├── tts.go              Voxtral TTS client
-├── llm.go              Mistral chat/completions client (streaming)
-├── mcp.go              tools/list + tools/call orchestration
-├── tools_map.go        MCP inputSchema ↔ Mistral function spec
-├── session.go          Per-MAC state machine (idle/listening/thinking/speaking)
-└── config.go           Per-agent prompt + voice + model loaded from DB
+├── ota.go              POST /xiaozhi/ota/ — returns the WS URL + token
+├── ws.go               WSS upgrader, hello exchange, per-session loop, dispatch
+├── framing.go          BinaryProtocol2 encode/decode (16-byte big-endian header)
+├── opus.go             libopus wrapper (CGo via hraban/opus); decode/encode 16 kHz
+├── audio_util.go       WAV encode/decode, resample, peak-normalize, frame split,
+│                       float32 LE → int16 (for streaming TTS)
+├── stt.go              Voxtral STT client — multipart WAV upload (batch)
+├── tts.go              Voxtral TTS client — buffered WAV AND streaming SSE/pcm
+├── chat.go             Mistral chat completions + GenerateReplyWithTools loop
+│                       (file is `chat.go` not `llm.go` as originally planned)
+├── mcp.go              JSON-RPC client over the WS — Initialize, ListTools,
+│                       CallTool. Channel-based response routing
+├── tools_map.go        MCP tool list ↔ Mistral function spec, with blocklist filter
+├── vision.go           POST /xiaozhi/vision/explain — multipart JPEG handler,
+│                       per-session token auth, save to ./photos, branch on question
+├── vision_client.go    Mistral chat with image_url data URL (Pixtral path)
+├── emotion.go          ExtractEmotion(text) — strips [emotion:NAME] tags from
+│                       LLM reply, returns emotion + cleaned text
+├── session.go          Per-WS state: codec, audio buffers, history, MCP client,
+│                       VisionToken, three mutexes (write/reply/tools)
+└── config.go           Process-wide env-driven config — every knob in one place
 ```
 
-Add to `server/internal/cmd/cmd.go`:
+Wired in `server/internal/cmd/cmd.go`:
 
 ```go
-s.Group("/xiaozhi", func(g *ghttp.RouterGroup) {
-    g.POST("/ota/", mistral_gateway.OtaHandler)
-})
+s.BindHandler("POST:/xiaozhi/ota/", mistral_gateway.OtaHandler)
 s.BindHandler("/xiaozhi/v1/", mistral_gateway.WsHandler)
+s.BindHandler("POST:/xiaozhi/vision/explain", mistral_gateway.VisionExplainHandler)
 ```
 
-## Per-session state machine
+## Per-session state machine (SHIPPED)
+
+The shipped implementation differs from the original sketch in two
+key ways: STT is **batched** (not Voxtral Realtime), and the chat-tool
+loop runs in a **goroutine** so the WS read loop stays free to deliver
+MCP responses.
 
 ```
                      ┌────── hello in / out ──────┐
                      ▼                            │
-                 [READY] ─── tools/list req ──▶ [READY]
+                 [READY] ─── MCP initialize (vision url+token) ──▶ [READY]
+                     │   ─── MCP tools/list (paginated)        ──▶ [READY]
                      │
-                     │  first opus frame in
+                     │  user taps screen / wake-word fires
+                     │  device → "listen state:start"
                      ▼
-                [LISTENING] ─── opus → Voxtral Realtime PCM stream
-                     │  Voxtral final transcript
-                     ▼
-                [STT_DONE] ─── send {type:"stt", text}
-                     │
-                     ▼
-                [THINKING] ─── Mistral chat/completions (streamed)
-                     │
-                ┌────┴───── tool_calls? ──── yes ──┐
-                no                                 ▼
-                │                            [TOOL_CALL] ─ send mcp/tools/call
-                │                                 │
-                │                                 ▼
-                │                          [WAIT_TOOL_RESULT]
-                │                                 │  device responds
-                │                                 ▼
-                │                          back to THINKING (with tool result appended)
-                ▼
-            [SPEAKING] ─── send {type:"llm", emotion}
-                │           send {type:"tts", state:"start"}
-                │           per sentence: {type:"tts", state:"sentence_start", text}
-                │           Voxtral TTS → opus → BinaryProtocol2 frames
-                │           send {type:"tts", state:"stop"}
-                ▼
+                [LISTENING] ─── opus frames buffered (PCM + re-encoded opus)
+                     │  auto-flush at 50 frames (~3 s) — UI doesn't send listen:stop
+                     ▼  spawn playbackReply goroutine (mutex-guarded)
+            ┌── [STT] ─── PCM → WAV → POST /v1/audio/transcriptions
+            │       │  empty transcript → silent ack (tts:start + tts:stop) ─▶ READY
+            │       │
+            │       ▼
+            │   [CHAT-TOOL LOOP] ─── chat completions with tools[] (max 3 iters)
+            │       │
+            │   ┌───┴── tool_calls? ─── yes ──┐
+            │   no                            ▼
+            │   │                         MCP tools/call → device executes → result
+            │   │                         (response routed via channel from WS reader)
+            │   │                            │
+            │   │                            └──▶ append tool result, loop chat
+            │   ▼
+            │   [EMOTION + TTS] ─── ExtractEmotion → send {type:"llm", emotion}
+            │       │                send {type:"tts", state:"start"}
+            │       │                send {type:"tts", state:"sentence_start", text}
+            │       │                Voxtral TTS (streaming SSE preferred,
+            │       │                buffered WAV fallback) → opus 60ms frames
+            │       │                paced 50ms between writes (BP2)
+            │       │                send {type:"tts", state:"stop"}
+            └───────▼
                 [READY]
+
+  Concurrent on the WS read loop the entire time:
+    - inbound MCP responses → routed via sess.MCP.HandleResponse → channel → caller
+    - inbound listen:start/detect/stop → state transitions
+    - inbound audio frames → buffer or ignore based on listening flag
 ```
+
+The key concurrency invariant: every write to the WS conn goes through
+`sess.WriteJSON` / `sess.WriteBinary`, which hold `sess.WriteMu`.
+Without this lock, the playback goroutine and the MCP-request
+goroutine would corrupt frames (gorilla/websocket allows one
+concurrent writer, period).
 
 ## Concrete dependencies to add
 
@@ -352,31 +389,48 @@ libopus-dev    (Debian/Ubuntu)
 opus           (macOS via brew)
 ```
 
-## Suggested build order
+## Build order — original plan vs. what shipped
 
-| Milestone | Goal | Validates |
-| --- | --- | --- |
-| **M1: OTA stub** | Gateway returns a static OTA JSON; firmware boots, reads it, persists URL | Discovery + headers |
-| **M2: Hello echo** | Gateway accepts WS connection, echoes hello, holds it open | Auth + handshake |
-| **M3: Audio loopback** | Decode opus → re-encode → send back; you hear yourself in the speaker | BinaryProtocol2 + opus + audio_params |
-| **M4: Static TTS** | On any incoming audio, send a fixed Voxtral TTS reply ("hello world") | TTS + sentence_start sequencing |
-| **M5: Full STT** | Stream incoming opus to Voxtral Realtime, send `stt` events | Realtime STT |
-| **M6: LLM only** | After STT, Mistral chat → TTS reply (no tools yet) | End-to-end voice loop |
-| **M7: tools/list** | On hello, request `tools/list`, log them | MCP discovery |
-| **M8: tool_calls** | Add tool defs to Mistral; route `tool_calls` back via MCP; feed results | Function-calling round trip |
-| **M9: Emotion** | Send `{type:"llm", emotion}` based on Mistral output (extra prompt or classifier) | Avatar reaction |
-| **M10: Multi-agent** | Per-MAC agent config (prompt, voice, model) loaded from DB | Production-ready |
+| # | Original plan | What shipped | Commit |
+| --- | --- | --- | --- |
+| **M1** | OTA stub | OTA stub — gateway returns WS URL, device boots, reads it, persists | `424596f` |
+| **M2** | Hello echo | Hello echo — WS upgrade, JSON hello round-trip, holds connection open | `424596f` (same commit as M1) |
+| **M3** | Audio loopback | Audio loopback — decode opus → re-encode → send back. Caller hears themselves. Auto-flush at 50 frames added because StackChan UI never sends `listen:stop` | `ed22cfd` |
+| **M4** | Static TTS | Static Voxtral TTS reply, with peak-normalize boost, ticker pacing of frames, voice auto-discovery | `5dc3ff5` |
+| **M5** | **Full STT (Voxtral Realtime)** | **Batched STT** — buffered PCM → WAV → `POST /v1/audio/transcriptions`. Realtime would have been overkill for the auto-flush model | `509e8ab` |
+| **M6** | LLM only | **Streaming TTS via SSE** — observed Voxtral TTFA is ~3 s anyway, but the streaming path's 5xx retry hides transient `unreachable_backend` errors transparently | `02ce3ba` |
+| **M7** | tools/list | **Conversational chat replies** — replaces the M5 "You said: %s" template with `mistral-small-latest` + per-session history. (M7 in original plan slid to M8a) | `d9989af` |
+| **M8a** | (was M7) | MCP `tools/list` discovery — JSON-RPC over the WS, channel-based response routing, paginated via `nextCursor` | `555e2cd` |
+| **M8b** | (was M8) | Chat function-calling round-trip — `GenerateReplyWithTools` loop (max 3 iters), defensive `type=function` normalization, `take_photo` blocklist guard | `5c1719c` |
+| **fix** | — | Silent on empty transcripts (silent `tts:start`/`tts:stop` to keep device unstuck) | `9ef5725` |
+| **M9** | (was M10 territory) | **Vision** — `/xiaozhi/vision/explain` endpoint, MCP `initialize` with `capabilities.vision.{url, token}`, save-only vs analyze split, mistral-medium-latest | `2a260ff` |
+| **M10** | Emotion | Avatar emotion — inline `[emotion:NAME]` tags in LLM reply, parsed gateway-side, sent as `llm` event before TTS | `9217d88` |
+| **M11** | (was "M10: Multi-agent") | **Wishlist — not shipped yet**: per-MAC agent config (prompt, voice, model) loaded from DB | — |
 
-Stop at M3 to confirm the wire protocol works before involving any
-Mistral APIs. Stop at M6 if you don't need device tools. Tools are
-needed if you want the LLM to move the head/play dances/etc.
+### Why the numbering drifted
+
+The original plan treated streaming TTS as a *mitigation strategy* for
+M6 (LLM-only), not as its own milestone. We promoted it to M6 once it
+became clear the work was substantial enough to ship separately. That
+shifted everything downstream by one. We also added a vision milestone
+(M9) that wasn't in the original plan — it became feasible once MCP
+function-calling worked, and the existing `take_photo` MCP tool only
+needed an HTTP backend to wire up.
+
+### Stopping points
+
+- Stop at **M3** to confirm the wire protocol works without any Mistral key.
+- Stop at **M5** if you only need transcription / echo without conversation.
+- Stop at **M7** if you want chat but not device control.
+- Stop at **M8b** if you don't need the camera.
+- Go all the way to **M10** for the demo-grade experience.
 
 ## Risks and mitigations
 
 | Risk | Mitigation |
 | --- | --- |
 | Wire-protocol drift on xiaozhi version bumps | Pin the firmware to v2.2.4 (already in `dependencies.lock`); validate before bumping. Or vendor a fork of `xiaozhi-esp32` you control |
-| Voxtral Realtime + Mistral chat + Voxtral TTS sequential latency too high | Use streaming on all three; start TTS on first sentence; cap LLM `max_tokens` |
+| Voxtral TTS first-chunk latency (~3 s observed) | Streaming SSE doesn't help much because Voxtral generates most of the audio before sending the first event. The remaining mitigation is **streaming chat → first-sentence TTS** (split the assistant reply on `.` / `!` / `?` and start TTS per sentence) — not yet shipped, on the wishlist. Cap `max_tokens` at 200 (~15-25 spoken seconds) for short replies |
 | Opus framing edge cases (DTX silence, partial frames) | Use `BinaryProtocol2` with timestamps; let `audio_service.cc` on the device handle jitter buffering |
 | MCP `tools/list` pagination | Implement `cursor` / `nextCursor` handling — devices may return large lists in chunks |
 | Server-side AEC | Set `features.aec` in your hello response based on the device claim; rely on the device's AFE for now |
