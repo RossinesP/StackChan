@@ -77,23 +77,6 @@ enum class CommonLogLevel {
  * @brief
  *
  */
-namespace app_center {
-
-struct AppInfo_t {
-    std::string name;
-    std::string iconUrl;
-    std::string description;
-    std::string firmwareUrl;
-};
-
-using AppInfoList_t = std::vector<AppInfo_t>;
-
-};  // namespace app_center
-
-/**
- * @brief
- *
- */
 enum class WifiStatus {
     None = 0,
     Low,
@@ -276,10 +259,6 @@ public:
     void startNetwork(std::function<void(std::string_view)> onLog);
     WifiStatus getWifiStatus();
     void startSntp();
-
-    /* -------------------------------- App center ------------------------------- */
-    app_center::AppInfoList_t fetchAppList();
-    void launchApp(std::string_view url, std::function<void(int)> onProgress);
 
     /* --------------------------------- EzData --------------------------------- */
     void startEzDataService(std::function<void(std::string_view)> onStartLog);
