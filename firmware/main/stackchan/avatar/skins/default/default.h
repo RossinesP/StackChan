@@ -26,6 +26,10 @@ public:
 
 private:
     std::unique_ptr<uitk::lvgl_cpp::Container> _pannel;
+    std::unique_ptr<uitk::lvgl_cpp::Image> _background;
+    std::unique_ptr<uitk::lvgl_cpp::Image> _foreground;
+    lv_image_dsc_t _background_image;
+    lv_image_dsc_t _foreground_image;
 };
 
 /**
