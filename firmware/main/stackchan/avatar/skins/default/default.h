@@ -29,15 +29,18 @@ public:
 
 private:
     void setFaceAnimation(const Emotion& emotion);
+    void setEmotionIcon(const Emotion& emotion);
 
     std::unique_ptr<uitk::lvgl_cpp::Container> _pannel;
     std::unique_ptr<uitk::lvgl_cpp::Image> _background;
     std::unique_ptr<uitk::lvgl_cpp::Image> _face;
+    std::unique_ptr<uitk::lvgl_cpp::Label> _emotion_icon;
     std::unique_ptr<uitk::lvgl_cpp::Image> _foreground;
     std::unique_ptr<LvglGif> _face_gif;
     lv_image_dsc_t _background_image;
     lv_image_dsc_t _face_image;
     lv_image_dsc_t _foreground_image;
+    const lv_font_t* _emoji_font = nullptr;
     const char* _face_asset_name = nullptr;
 };
 
