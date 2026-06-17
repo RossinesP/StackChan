@@ -363,6 +363,7 @@ private:
     void PollTouchpad()
     {
         if (!ft6336_->UpdateTouchPoint()) {
+            hal_bridge::set_touch_point(0, -1, -1);
             return;
         }
         auto& touch_point = ft6336_->GetTouchPoint();
