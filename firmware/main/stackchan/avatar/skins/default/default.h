@@ -6,6 +6,7 @@
 #pragma once
 #include "../../avatar/avatar.h"
 #include "../../avatar/elements/feature.h"
+#include <gif/lvgl_gif.h>
 #include <lvgl.h>
 #include <smooth_lvgl.hpp>
 #include <memory>
@@ -21,15 +22,23 @@ public:
     lv_color_t primaryColor   = lv_color_white();
     lv_color_t secondaryColor = lv_color_black();
 
+    ~DefaultAvatar() override;
     void init(lv_obj_t* parent, const lv_font_t* font = &lv_font_montserrat_16);
     uitk::lvgl_cpp::Container* getPanel() const;
+    void setEmotion(const Emotion& emotion) override;
 
 private:
+    void setFaceAnimation(const Emotion& emotion);
+
     std::unique_ptr<uitk::lvgl_cpp::Container> _pannel;
     std::unique_ptr<uitk::lvgl_cpp::Image> _background;
+    std::unique_ptr<uitk::lvgl_cpp::Image> _face;
     std::unique_ptr<uitk::lvgl_cpp::Image> _foreground;
+    std::unique_ptr<LvglGif> _face_gif;
     lv_image_dsc_t _background_image;
+    lv_image_dsc_t _face_image;
     lv_image_dsc_t _foreground_image;
+    const char* _face_asset_name = nullptr;
 };
 
 /**
