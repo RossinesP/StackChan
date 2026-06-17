@@ -144,22 +144,31 @@ void Hal::xiaozhi_board_init()
 
 static void _stackchan_update_task(void* param)
 {
+    static constexpr uint32_t kIdleUpdateDelayMs     = 20;
+    static constexpr uint32_t kBusyUpdateDelayMs     = 120;
+    static constexpr uint32_t kStartupUpdateDelayMs  = 250;
+
     bool is_setup_done = false;
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(20));
+        const bool is_xiaozhi_ready = hal_bridge::is_xiaozhi_ready();
+        const bool is_xiaozhi_idle  = hal_bridge::is_xiaozhi_idle();
+        uint32_t update_delay_ms    = kIdleUpdateDelayMs;
+        if (!is_xiaozhi_ready) {
+            update_delay_ms = kStartupUpdateDelayMs;
+        } else if (!is_xiaozhi_idle) {
+            update_delay_ms = kBusyUpdateDelayMs;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(update_delay_ms));
 
         tools::update_reminders();
 
         LvglLockGuard lock;
 
-        if (!hal_bridge::is_xiaozhi_idle()) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-
         GetStackChan().update();
 
-        if (!hal_bridge::is_xiaozhi_ready()) {
+        if (!is_xiaozhi_ready) {
             continue;
         }
 
@@ -197,7 +206,7 @@ void Hal::startXiaozhi()
     });
 
     // Start stackchan update task
-    xTaskCreatePinnedToCore(_stackchan_update_task, "stackchan", 4096, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(_stackchan_update_task, "stackchan", 4096, NULL, 1, NULL, 1);
 
     hal_bridge::start_xiaozhi_app();
 }

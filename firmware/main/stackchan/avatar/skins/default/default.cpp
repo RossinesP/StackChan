@@ -17,7 +17,7 @@ static constexpr int kAvatarPanelHeight = 240;
 static constexpr int kFaceOffsetY       = 18;
 static constexpr int kEmotionIconSize   = 32;
 static constexpr int kEmotionIconGap    = 4;
-static constexpr uint32_t kFaceMinFrameDelayMs = 100;
+static constexpr uint32_t kFaceMinFrameDelayMs = 200;
 static constexpr const char* kNeutralFaceAsset = "avatar_face_neutral.gif";
 
 static const char* face_asset_for_emotion(const Emotion& emotion)
