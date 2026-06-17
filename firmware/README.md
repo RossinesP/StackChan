@@ -38,6 +38,16 @@ idf.py set-target esp32s3
 idf.py build
 ```
 
+### Host-side tests
+
+The motion coordinate helpers can be tested without ESP-IDF hardware:
+
+```bash
+cmake -S tests -B build-host-tests
+cmake --build build-host-tests
+ctest --test-dir build-host-tests --output-on-failure
+```
+
 ### Flash
 
 ```bash
