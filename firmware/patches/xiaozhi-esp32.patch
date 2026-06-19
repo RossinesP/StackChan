@@ -271,3 +271,105 @@ index 7bc917b..874b137 100644
  };
  
  #endif // I2C_DEVICE_H
+diff --git a/main/display/lvgl_display/gif/lvgl_gif.cc b/main/display/lvgl_display/gif/lvgl_gif.cc
+index de00257..b6a5372 100644
+--- a/main/display/lvgl_display/gif/lvgl_gif.cc
++++ b/main/display/lvgl_display/gif/lvgl_gif.cc
+@@ -4,9 +4,11 @@
+ 
+ #define TAG "LvglGif"
+ 
++static constexpr uint32_t kDefaultTimerPeriodMs = 10;
++
+ LvglGif::LvglGif(const lv_img_dsc_t* img_dsc)
+     : gif_(nullptr), timer_(nullptr), last_call_(0), playing_(false), loaded_(false),
+-      loop_delay_ms_(0), loop_waiting_(false), loop_wait_start_(0) {
++      loop_delay_ms_(0), loop_waiting_(false), loop_wait_start_(0), min_frame_delay_ms_(0) {
+     if (!img_dsc || !img_dsc->data) {
+         ESP_LOGE(TAG, "Invalid image descriptor");
+         return;
+@@ -62,7 +64,7 @@ void LvglGif::Start() {
+         timer_ = lv_timer_create([](lv_timer_t* timer) {
+             LvglGif* gif_obj = static_cast<LvglGif*>(lv_timer_get_user_data(timer));
+             gif_obj->NextFrame();
+-        }, 10, this);
++        }, GetTimerPeriod(), this);
+     }
+ 
+     if (timer_) {
+@@ -151,6 +153,14 @@ void LvglGif::SetLoopDelay(uint32_t delay_ms) {
+     ESP_LOGD(TAG, "Loop delay set to %lu ms", delay_ms);
+ }
+ 
++void LvglGif::SetMinFrameDelay(uint32_t delay_ms) {
++    min_frame_delay_ms_ = delay_ms;
++    if (timer_) {
++        lv_timer_set_period(timer_, GetTimerPeriod());
++    }
++    ESP_LOGD(TAG, "Minimum frame delay set to %lu ms", delay_ms);
++}
++
+ uint16_t LvglGif::width() const {
+     if (!loaded_ || !gif_) {
+         return 0;
+@@ -188,7 +198,12 @@ void LvglGif::NextFrame() {
+ 
+     // Check if enough time has passed for the next frame
+     uint32_t elapsed = lv_tick_elaps(last_call_);
+-    if (elapsed < gif_->gce.delay * 10) {
++    uint32_t frame_delay_ms = gif_->gce.delay * 10;
++    if (frame_delay_ms < min_frame_delay_ms_) {
++        frame_delay_ms = min_frame_delay_ms_;
++    }
++
++    if (elapsed < frame_delay_ms) {
+         return;
+     }
+ 
+@@ -231,6 +246,10 @@ void LvglGif::NextFrame() {
+     }
+ }
+ 
++uint32_t LvglGif::GetTimerPeriod() const {
++    return min_frame_delay_ms_ > kDefaultTimerPeriodMs ? min_frame_delay_ms_ : kDefaultTimerPeriodMs;
++}
++
+ void LvglGif::Cleanup() {
+     // Stop and delete timer
+     if (timer_) {
+diff --git a/main/display/lvgl_display/gif/lvgl_gif.h b/main/display/lvgl_display/gif/lvgl_gif.h
+index 17b9afd..f6cb27b 100644
+--- a/main/display/lvgl_display/gif/lvgl_gif.h
++++ b/main/display/lvgl_display/gif/lvgl_gif.h
+@@ -69,6 +69,12 @@ public:
+      */
+     void SetLoopDelay(uint32_t delay_ms);
+ 
++    /**
++     * Set the minimum delay between rendered frames.
++     * @param delay_ms Minimum frame delay in milliseconds. 0 uses the GIF's own timing.
++     */
++    void SetMinFrameDelay(uint32_t delay_ms);
++
+     /**
+      * Get GIF dimensions
+      */
+@@ -101,6 +107,9 @@ private:
+     uint32_t loop_delay_ms_;      // Delay between loops in milliseconds
+     bool loop_waiting_;           // Whether we're waiting for the next loop
+     uint32_t loop_wait_start_;    // Timestamp when loop wait started
++
++    // Frame-rate throttling
++    uint32_t min_frame_delay_ms_; // Minimum delay between decoded/rendered frames
+     
+     // Frame update callback
+     std::function<void()> frame_callback_;
+@@ -109,6 +118,8 @@ private:
+      * Update to next frame
+      */
+     void NextFrame();
++
++    uint32_t GetTimerPeriod() const;
+     
+     /**
+      * Cleanup resources
